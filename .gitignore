@@ -1,0 +1,8 @@
+bin/noti-toast
+*.tmp.*
+.DS_Store
+.claude/settings.local.json
+.venv/
+.ruff_cache/
+
+__pycache__/

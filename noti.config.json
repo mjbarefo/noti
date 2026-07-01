@@ -1,0 +1,31 @@
+{
+  "_comment": "Optional overrides for noti's built-in defaults. Delete any key to use the default. A per-user copy at ~/.config/noti/config.json overrides this file.",
+
+  "toast": {
+    "corner": "top-right",
+    "ask_timeout_seconds": 90,
+    "summary_timeout_seconds": 6,
+    "hotkeys": true
+  },
+
+  "approval": {
+    "governed_tools": ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
+    "govern_mcp": true,
+    "bash_safe_commands": [
+      "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
+      "git branch", "git show", "which", "head", "tail", "wc", "date",
+      "whoami", "grep", "tree"
+    ],
+    "bash_always_mode": "exact",
+    "mcp_autoallow_servers": [],
+    "mcp_read_verbs": ["get", "list", "search", "read", "download", "find",
+                       "suggest", "describe", "view"],
+    "rule_scope": "project_local"
+  },
+
+  "summary": {
+    "enabled": true,
+    "max_chars": 240,
+    "show_tally": true
+  }
+}

@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+"""noti — tiny toast prompts + turn summaries for Claude Code (and any agent).
+
+REUSABLE PRIMITIVES (any script/agent can call these):
+    noti ask    --title T --message M --buttons Yes,Always,No
+        Shows a blocking corner toast. Prints the clicked label to stdout;
+        exit code is the button index (0-based), or 124 on timeout.
+    noti notify --title T --body B
+        Shows a non-blocking summary toast that auto-dismisses. Returns at once.
+
+CLAUDE CODE HOOK ADAPTER (wired up by `noti install`):
+    noti hook pretooluse   # reads PreToolUse JSON on stdin -> permission decision
+    noti hook stop         # reads Stop JSON on stdin -> end-of-turn summary toast
+    noti decide            # dry-run: print the policy decision, never show a toast
+
+SETUP:
+    noti build | install [--global|--project DIR] | uninstall | doctor | version
+
+Everything is dependency-free stdlib Python 3 + one tiny Swift binary (bin/noti-toast).
+Design rule #1: a bug in here must NEVER block your Claude Code session. Every hook
+path is wrapped so that on any error we emit no decision (exit 0) and let Claude's
+own permission flow take over.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import fnmatch
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+HERE = Path(__file__).resolve().parent
+BINARY = HERE / "bin" / "noti-toast"
+SWIFT_SRC = HERE / "bin" / "noti-toast.swift"
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "noti"
+SLOT_DIR = CONFIG_HOME / "slots"
+TALLY_DIR = CONFIG_HOME / "tally"
+LOG_FILE = CONFIG_HOME / "noti.log"
+
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+DEFAULT_CONFIG = {
+    "toast": {
+        "corner": "top-right",
+        "ask_timeout_seconds": 90,      # toast self-dismisses -> falls back to terminal
+        "summary_timeout_seconds": 6,
+        # Hover-armed keyboard shortcuts on the ask toast: move the mouse over
+        # the card, then press y/a/n (button initials), Return, or Esc. Keys are
+        # captured ONLY while hovering, so a toast can never eat a keystroke
+        # you meant for the terminal.
+        "hotkeys": True,
+    },
+    "approval": {
+        # Tools that trigger a Yes/Always/No toast (read-only tools are never wired up).
+        "governed_tools": ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
+        "govern_mcp": True,
+        # Bash commands that auto-allow silently (only when they contain NO shell
+        # metacharacters). Keep this list genuinely read-only.
+        # Genuinely read-only verbs only. NOT env/find/rg — those can exec or
+        # delete without any shell metacharacter (env <prog>, find -delete, rg --pre).
+        "bash_safe_commands": [
+            "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
+            "git branch", "git show", "which", "head", "tail", "wc", "date",
+            "whoami", "grep", "tree",
+        ],
+        # "exact" (safe: rule matches only this command) | "prefix" (broader)
+        "bash_always_mode": "exact",
+        # MCP auto-allow is OFF by default — every governed MCP tool prompts. To
+        # silence read-only calls from servers you trust, add their server name
+        # here; a call then auto-allows only if its server is listed AND its method
+        # starts with a read verb AND contains no mutating token.
+        "mcp_autoallow_servers": [],
+        "mcp_read_verbs": ["get", "list", "search", "read", "download", "find",
+                           "suggest", "describe", "view"],
+        # Where "Always" writes rules: project_local | project | global
+        "rule_scope": "project_local",
+    },
+    "summary": {
+        "enabled": True,
+        "max_chars": 240,
+        "show_tally": True,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# small utilities
+# ---------------------------------------------------------------------------
+
+def debug(msg: str) -> None:
+    if os.environ.get("NOTI_DEBUG"):
+        try:
+            CONFIG_HOME.mkdir(parents=True, exist_ok=True)
+            with open(LOG_FILE, "a") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    for path in (HERE / "noti.config.json", CONFIG_HOME / "config.json"):
+        data = read_json(path, None)
+        if isinstance(data, dict):
+            _deep_merge(cfg, data)
+    return cfg
+
+
+def _deep_merge(base: dict, over: dict) -> None:
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def read_json(path: Path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def atomic_write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(name: str):
+    CONFIG_HOME.mkdir(parents=True, exist_ok=True)
+    lock = open(CONFIG_HOME / name, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def trunc(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def home_short(p: str) -> str:
+    try:
+        return "~/" + str(Path(p).resolve().relative_to(Path.home()))
+    except Exception:
+        return p
+
+# ---------------------------------------------------------------------------
+# toast invocation
+# ---------------------------------------------------------------------------
+
+def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
+               kind: str = "", project: str = "", footer: str = "") -> dict:
+    env = dict(os.environ)
+    env["NOTI_TIMEOUT"] = str(timeout)
+    env["NOTI_CORNER"] = corner
+    env["NOTI_HOTKEYS"] = "1" if hotkeys else "0"
+    if slot is not None:
+        env["NOTI_SLOT"] = str(slot)
+    if kind:
+        env["NOTI_KIND"] = kind        # colors the semantic dot; mono message
+    if project:
+        env["NOTI_PROJECT"] = project  # eyebrow line: which session is asking
+    if footer:
+        env["NOTI_FOOTER"] = footer    # small mono footer (summary: the tally)
+    return env
+
+
+def toast_ask(title, message, buttons, timeout, corner, slot, hotkeys=True,
+              kind="", project=""):
+    """Blocking. Returns (returncode, label). returncode 124 == timed out."""
+    if not BINARY.exists():
+        raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
+    proc = subprocess.run(
+        [str(BINARY), "ask", title, message, *buttons],
+        capture_output=True, text=True,
+        env=_toast_env(timeout, slot, corner, hotkeys, kind, project),
+    )
+    return proc.returncode, proc.stdout.strip()
+
+
+def toast_summary(title, body, timeout, corner, kind="note", footer=""):
+    """Non-blocking. Spawns a detached toast that auto-dismisses, then returns."""
+    if not BINARY.exists():
+        raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
+    subprocess.Popen(
+        [str(BINARY), "summary", title, body],
+        env=_toast_env(timeout, None, corner, kind=kind, footer=footer),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def acquire_slot(max_slots: int = 8) -> int:
+    """Claim the lowest free vertical slot so concurrent toasts don't overlap."""
+    SLOT_DIR.mkdir(parents=True, exist_ok=True)
+    for i in range(max_slots):
+        p = SLOT_DIR / f"slot-{i}"
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return i
+        except FileExistsError:
+            # reclaim a stale slot (>30 min old — a toast never lives that long)
+            try:
+                if time.time() - p.stat().st_mtime > 1800:
+                    p.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass
+    return 0  # all busy: overlap rather than fail
+
+
+def release_slot(i) -> None:
+    if i is None:
+        return
+    try:
+        (SLOT_DIR / f"slot-{i}").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# permission rules: matching + minting (must round-trip with each other)
+# ---------------------------------------------------------------------------
+
+def settings_files(cwd: str):
+    return [
+        Path.home() / ".claude" / "settings.json",
+        Path(cwd) / ".claude" / "settings.json",
+        Path(cwd) / ".claude" / "settings.local.json",
+    ]
+
+
+def load_patterns(cwd: str, kind: str):
+    """kind = 'allow' | 'deny'. Merge across the settings hierarchy."""
+    out = []
+    for f in settings_files(cwd):
+        data = read_json(f, {})
+        perms = (data or {}).get("permissions", {})
+        for p in perms.get(kind, []) or []:
+            if isinstance(p, str):
+                out.append(p)
+    return out
+
+
+def abs_rule_path(path: str) -> str:
+    """Claude writes absolute paths with a leading double slash: //Users/..."""
+    return "/" + os.path.abspath(os.path.expanduser(path))  # '/' + '/Users/..' -> '//Users/..'
+
+
+def make_rule(tool: str, tinput: dict, cfg: dict):
+    """Mint a permissions.allow pattern for an 'Always' grant. None if undecidable."""
+    if tool == "Bash":
+        cmd = (tinput.get("command") or "").strip()
+        if not cmd:
+            return None
+        if cmd.endswith("*"):
+            # Claude's engine reads a trailing * as a PREFIX rule, so minting
+            # "Bash(rm -rf node_modules/*)" would allow far more than the user
+            # approved. Refuse — 'Always' quietly degrades to a one-time 'Yes'.
+            return None
+        if cfg["approval"]["bash_always_mode"] == "prefix":
+            head = " ".join(cmd.split()[:2])
+            return f"Bash({head}:*)"
+        return f"Bash({cmd})"  # exact: safe default, never broadens a verb
+    if tool in EDIT_TOOLS:
+        path = tinput.get("file_path") or tinput.get("notebook_path")
+        if not path:
+            return None
+        name = "Write" if tool == "Write" else "Edit"
+        return f"{name}({abs_rule_path(path)})"
+    if tool == "WebFetch":
+        host = urlparse(tinput.get("url", "")).hostname
+        return f"WebFetch(domain:{host})" if host else None
+    if tool.startswith("mcp__"):
+        return tool  # MCP grants are by exact tool id
+    return None
+
+
+def _bash_match(cmd: str, inner: str) -> bool:
+    for suf in (":*", " *"):     # Claude's two word-boundary prefix spellings
+        if inner.endswith(suf):
+            prefix = inner[:-2].rstrip()
+            return cmd == prefix or cmd.startswith(prefix + " ")   # 'git log' !~ 'git logger'
+    return cmd == inner          # a bare trailing * stays LITERAL here: Claude reads it as
+                                 # a prefix, but treating it that way would broaden what an
+                                 # allow rule covers — stricter is safe (worst case: a toast)
+
+
+def _glob_rx(pat: str) -> str:
+    rx = re.escape(pat)
+    return rx.replace(r"\*\*/", r"(?:.*/)?").replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+
+
+def _path_match(path: str, inner: str, cwd: str) -> bool:
+    # Claude's path anchors: //abs, ~/home, /project-root, bare = relative.
+    # The anchor base (home/cwd) is trusted literal text and is regex-escaped
+    # SEPARATELY from the user-authored glob: escaping the joined string would
+    # let a literal '*' in a real directory name re-expand into a wildcard.
+    if inner.startswith("//"):
+        rx = _glob_rx(inner[1:])
+    elif inner.startswith("~"):
+        rx = re.escape(str(Path.home())) + _glob_rx(inner[1:])
+    elif inner.startswith("/"):
+        rx = re.escape(cwd.rstrip("/")) + _glob_rx(inner)
+    else:
+        rx = re.escape(cwd.rstrip("/")) + "/" + _glob_rx(inner)
+    target = os.path.abspath(os.path.expanduser(path))
+    return re.fullmatch(rx, target) is not None
+
+
+def _host_match(host: str, dom: str) -> bool:
+    if dom.startswith("*."):
+        bare = dom[2:]
+        return host == bare or host.endswith("." + bare)
+    return host == dom or host.endswith("." + dom)
+
+
+def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "") -> bool:
+    cwd = cwd or os.getcwd()
+    if "(" not in pat:
+        if pat == tool:
+            return True
+        # Claude server-scoped MCP rule: `mcp__server` covers every `mcp__server__tool`
+        if pat.startswith("mcp__") and tool.startswith(pat + "__"):
+            return True
+        # Claude MCP wildcard rule: `mcp__server__get_*`
+        if pat.startswith("mcp__") and "*" in pat:
+            return fnmatch.fnmatchcase(tool, pat)
+        return False
+    name, _, rest = pat.partition("(")
+    # strip ONE closing paren — rstrip(")") would eat a command's own, e.g. `git log $(...)`
+    inner = rest[:-1] if rest.endswith(")") else rest
+    name_ok = (name == tool) or (name == "Edit" and tool in EDIT_TOOLS)
+    if not name_ok:
+        return False
+    if tool == "Bash":
+        return _bash_match((tinput.get("command") or "").strip(), inner)
+    if tool in EDIT_TOOLS:
+        return _path_match(tinput.get("file_path") or tinput.get("notebook_path") or "", inner, cwd)
+    if tool == "WebFetch":
+        if inner.startswith("domain:"):
+            return _host_match(urlparse(tinput.get("url", "")).hostname or "", inner[len("domain:"):])
+        return False
+    return False
+
+
+def matches_any(tool: str, tinput: dict, patterns, cwd: str = "") -> bool:
+    return any(pattern_matches(tool, tinput, p, cwd) for p in patterns)
+
+# ---------------------------------------------------------------------------
+# policy
+# ---------------------------------------------------------------------------
+
+_BASH_META = set("$`;|&<>(){}\n")
+# Flags that turn an otherwise read-only verb into a write/delete/exec. A safe
+# verb carrying any of these is NOT auto-allowed — defence-in-depth in case the
+# safelist is ever widened (e.g. someone re-adds find or rg via config).
+_BASH_DANGEROUS_FLAGS = ("-exec", "-execdir", "-delete", "-fls", "-fprint",
+                         "-fprintf", "-ok", "-okdir", "--pre", "--search-zip")
+
+# MCP method tokens that imply a state change or code execution — block auto-allow
+# if any appears anywhere in the method name.
+MCP_MUTATING_TOKENS = {
+    # state change
+    "create", "update", "delete", "send", "write", "remove", "drop", "replace",
+    "purge", "add", "move", "copy", "insert", "set", "modify", "apply", "label",
+    "unlabel", "respond", "archive", "trash", "upload", "edit", "patch", "post",
+    "put", "rename", "clear", "reset", "merge", "truncate", "cancel", "approve",
+    "share", "import", "export", "transfer", "submit",
+    # execution / lifecycle
+    "exec", "execute", "run", "invoke", "call", "push", "deploy", "publish",
+    "trigger", "schedule", "enable", "disable", "start", "stop", "grant", "revoke",
+}
+
+
+def is_safe_bash(command: str, cfg: dict) -> bool:
+    cmd = (command or "").strip()
+    if not cmd or any(c in _BASH_META for c in cmd):
+        return False
+    toks = cmd.split()
+    if any(t == f or t.startswith(f + "=") for t in toks for f in _BASH_DANGEROUS_FLAGS):
+        return False
+    return any(cmd == s or cmd.startswith(s + " ") for s in cfg["approval"]["bash_safe_commands"])
+
+
+def is_read_only_mcp(tool: str, cfg: dict) -> bool:
+    """Opt-in only. A call auto-allows iff its server is on mcp_autoallow_servers
+    AND its method starts with a read verb AND carries no mutating token. With the
+    default (empty) allowlist, every governed MCP tool prompts."""
+    servers = cfg["approval"].get("mcp_autoallow_servers")
+    if not isinstance(servers, list) or not servers:   # a stray string must not become a substring test
+        return False
+    parts = tool.split("__")
+    if len(parts) < 3:
+        return False
+    server, method = parts[1], "__".join(parts[2:]).lower()
+    if server not in servers:
+        return False
+    tokens = re.split(r"[_\-]+", method)
+    if any(t in MCP_MUTATING_TOKENS for t in tokens):
+        return False
+    return bool(tokens) and tokens[0] in set(cfg["approval"]["mcp_read_verbs"])
+
+
+def is_governed(tool: str, cfg: dict) -> bool:
+    if tool in cfg["approval"]["governed_tools"]:
+        return True
+    return bool(cfg["approval"]["govern_mcp"]) and tool.startswith("mcp__")
+
+
+def render_call(tool: str, tinput: dict):
+    """-> (kind, title, message). kind drives the toast's semantic dot color
+    and monospace treatment: run | edit | fetch | mcp | tool."""
+    if tool == "Bash":
+        return "run", "Run command", trunc(tinput.get("command", ""), 220)
+    if tool in EDIT_TOOLS:
+        path = tinput.get("file_path") or tinput.get("notebook_path") or "?"
+        verb = "Write" if tool == "Write" else "Edit"
+        return "edit", f"{verb} file", home_short(path)
+    if tool == "WebFetch":
+        return "fetch", "Fetch URL", trunc(tinput.get("url", ""), 220)
+    if tool.startswith("mcp__"):
+        parts = tool.split("__")
+        server = parts[1] if len(parts) > 1 else "mcp"
+        method = "_".join(parts[2:]) if len(parts) > 2 else tool
+        return "mcp", f"{server}: {method}", trunc(json.dumps(tinput, ensure_ascii=False), 200)
+    return "tool", tool, trunc(json.dumps(tinput, ensure_ascii=False), 200)
+
+
+def evaluate(payload: dict, cfg: dict) -> dict:
+    """Pure decision. Returns dict with action in
+    {allow, deny, defer, prompt} (+ reason / title / message)."""
+    tool = payload.get("tool_name", "")
+    tinput = payload.get("tool_input", {}) or {}
+    mode = payload.get("permission_mode", "default")
+    cwd = payload.get("cwd") or os.getcwd()
+
+    # 1. Only govern the tools we were asked to.
+    if not is_governed(tool, cfg):
+        return {"action": "defer", "reason": "noti: ungoverned tool"}
+
+    # 2. Honour an explicit deny rule before ANYTHING else — even before the
+    #    bypass/plan/acceptEdits short-circuits. A deny rule is the user's hard
+    #    floor; PreToolUse hooks still fire (and may block) in bypass mode, so
+    #    noti enforces the deny rather than letting a permissive mode override it.
+    if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd):
+        return {"action": "deny", "reason": "noti: matches a deny rule"}
+
+    # 3. Respect the user's chosen permission mode (after deny). dontAsk means
+    #    "never prompt me" — noti must not toast either. (auto mode falls
+    #    through: noti's toast simply replaces the prompt the classifier
+    #    would have shown.)
+    if mode in ("bypassPermissions", "plan", "dontAsk"):
+        return {"action": "defer", "reason": f"noti: {mode} mode"}
+
+    # 4. acceptEdits: Claude already auto-accepts edits — don't nag.
+    if mode == "acceptEdits" and tool in EDIT_TOOLS:
+        return {"action": "allow", "reason": "noti: acceptEdits mode"}
+
+    # 5. Already allowed (Claude's rules or a prior 'Always') -> allow silently.
+    #    NB: must be 'allow', not 'defer' — in default mode a defer would surface
+    #    Claude's own terminal prompt, defeating the toast.
+    if matches_any(tool, tinput, load_patterns(cwd, "allow"), cwd):
+        return {"action": "allow", "reason": "noti: already allowed"}
+
+    # 6. Conservative auto-allow surfaces.
+    if tool == "Bash" and is_safe_bash(tinput.get("command", ""), cfg):
+        return {"action": "allow", "reason": "noti: safe read-only command"}
+    if tool.startswith("mcp__") and is_read_only_mcp(tool, cfg):
+        return {"action": "allow", "reason": "noti: read-only MCP call"}
+
+    # 7. A genuine human moment.
+    kind, title, message = render_call(tool, tinput)
+    return {"action": "prompt", "kind": kind, "title": title, "message": message,
+            "project": os.path.basename(cwd.rstrip("/"))}
+
+# ---------------------------------------------------------------------------
+# per-session tool tally (powers the summary's second line)
+# ---------------------------------------------------------------------------
+
+def tally_record(payload: dict) -> None:
+    tool = payload.get("tool_name", "")
+    tinput = payload.get("tool_input", {}) or {}
+    sid = payload.get("session_id", "default")
+    path = TALLY_DIR / f"{sid}.json"
+    with locked("tally.lock"):
+        data = read_json(path, {}) or {}
+        data.setdefault("bash", 0)
+        data.setdefault("files", [])
+        data.setdefault("webfetch", 0)
+        data.setdefault("mcp", 0)
+        if tool == "Bash":
+            data["bash"] += 1
+        elif tool in EDIT_TOOLS:
+            f = tinput.get("file_path") or tinput.get("notebook_path")
+            if f and f not in data["files"]:
+                data["files"].append(f)
+        elif tool == "WebFetch":
+            data["webfetch"] += 1
+        elif tool.startswith("mcp__"):
+            data["mcp"] += 1
+        atomic_write_json(path, data)
+
+
+def tally_read_and_clear(sid: str):
+    path = TALLY_DIR / f"{sid}.json"
+    with locked("tally.lock"):
+        data = read_json(path, None)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        # sessions killed before their Stop hook leave tallies behind — sweep them
+        try:
+            cutoff = time.time() - 48 * 3600
+            for p in TALLY_DIR.glob("*.json"):
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return data
+
+
+def format_tally(t) -> str:
+    if not t:
+        return ""
+    bits = []
+    if t.get("bash"):
+        bits.append(f"ran {t['bash']} command" + ("s" if t["bash"] != 1 else ""))
+    nf = len(t.get("files", []))
+    if nf:
+        bits.append(f"edited {nf} file" + ("s" if nf != 1 else ""))
+    if t.get("webfetch"):
+        bits.append(f"fetched {t['webfetch']} url" + ("s" if t["webfetch"] != 1 else ""))
+    if t.get("mcp"):
+        bits.append(f"{t['mcp']} MCP action" + ("s" if t["mcp"] != 1 else ""))
+    return " · ".join(bits)
+
+
+def last_message_from_transcript(path: str) -> str:
+    """Fallback for older Claude Code versions whose Stop payload lacks
+    last_assistant_message: recover it from the session transcript JSONL."""
+    best = ""
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("type") != "assistant" or e.get("isSidechain"):
+                    continue
+                content = (e.get("message") or {}).get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "\n".join(b.get("text", "") for b in content
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    continue
+                if text.strip():
+                    best = text
+    except Exception:
+        pass
+    return best
+
+
+def clean_summary(msg: str, maxc: int) -> str:
+    if not msg:
+        return ""
+    # drop fenced code blocks, then strip light markdown
+    msg = re.sub(r"```.*?```", " ", msg, flags=re.DOTALL)
+    lines = []
+    for ln in msg.splitlines():
+        s = ln.strip()
+        s = re.sub(r"^#{1,6}\s*", "", s)        # headings
+        s = re.sub(r"^[-*]\s+", "• ", s)   # bullets
+        s = re.sub(r"[`*_]", "", s)             # inline emphasis/code
+        if s:
+            lines.append(s)
+    return trunc(" ".join(lines), maxc)
+
+# ---------------------------------------------------------------------------
+# hook handlers
+# ---------------------------------------------------------------------------
+
+def emit_pretool(decision: str, reason: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason,
+    }}))
+
+
+def hook_pretooluse(payload: dict) -> int:
+    cfg = load_config()
+    d = evaluate(payload, cfg)
+    action = d["action"]
+    debug(f"pretooluse {payload.get('tool_name')} -> {action} ({d.get('reason','')})")
+
+    if action == "defer":
+        return 0                                  # exit 0, no JSON
+    if action == "allow":
+        tally_record(payload)
+        emit_pretool("allow", d.get("reason", "noti: allowed"))
+        return 0
+    if action == "deny":
+        emit_pretool("deny", d.get("reason", "noti: denied"))
+        return 0
+
+    # action == "prompt": show the toast.
+    slot = acquire_slot()
+    try:
+        rc, label = toast_ask(d["title"], d["message"], ["Yes", "Always", "No"],
+                              cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
+                              hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                              kind=d.get("kind", ""), project=d.get("project", ""))
+    except Exception as e:
+        debug(f"toast failed: {e}")
+        emit_pretool("ask", "noti: toast unavailable, asking in terminal")
+        return 0
+    finally:
+        release_slot(slot)
+
+    choice = label.lower()
+    if choice == "yes":
+        tally_record(payload)
+        emit_pretool("allow", "noti: approved")
+    elif choice == "always":
+        rule = make_rule(payload.get("tool_name", ""), payload.get("tool_input", {}) or {}, cfg)
+        if rule:
+            try:
+                write_rule(rule, payload, cfg)
+            except Exception as e:
+                debug(f"write_rule failed: {e}")
+        tally_record(payload)
+        emit_pretool("allow", f"noti: always-allowed [{rule}]" if rule else "noti: approved")
+    elif choice == "no":
+        emit_pretool("deny", "noti: denied by user")
+    else:
+        # rc 124 (timeout) or dismissed -> hand back to Claude's terminal prompt
+        emit_pretool("ask", "noti: no response, asking in terminal")
+    return 0
+
+
+def write_rule(rule: str, payload: dict, cfg: dict) -> None:
+    cwd = payload.get("cwd") or os.getcwd()
+    scope = cfg["approval"]["rule_scope"]
+    if scope == "global":
+        target = Path.home() / ".claude" / "settings.json"
+    elif scope == "project":
+        target = Path(cwd) / ".claude" / "settings.json"
+    else:
+        target = Path(cwd) / ".claude" / "settings.local.json"
+    with locked("rules.lock"):
+        if target.exists():
+            try:
+                with open(target) as f:
+                    data = json.load(f)
+            except Exception as e:
+                # NEVER overwrite a file we can't parse — that would wipe the
+                # user's real settings (including their deny rules). Abort.
+                debug(f"refusing to write rule: {target} is unparseable: {e}")
+                return
+            if not isinstance(data, dict):
+                debug(f"refusing to write rule: {target} is not a JSON object")
+                return
+            shutil.copy2(target, target.with_suffix(target.suffix + ".noti-prev"))
+        else:
+            data = {}
+        allow = data.setdefault("permissions", {}).setdefault("allow", [])
+        if rule not in allow:
+            allow.append(rule)
+            atomic_write_json(target, data)
+    debug(f"wrote rule {rule} -> {target}")
+
+
+def hook_stop(payload: dict) -> int:
+    cfg = load_config()
+    if not cfg["summary"]["enabled"]:
+        return 0
+    msg = payload.get("last_assistant_message") \
+        or last_message_from_transcript(payload.get("transcript_path") or "")
+    body = clean_summary(msg, cfg["summary"]["max_chars"])
+    tline = format_tally(tally_read_and_clear(payload.get("session_id", "default"))) \
+        if cfg["summary"]["show_tally"] else ""
+    if not body and not tline:
+        return 0                                  # nothing worth a toast
+    title = os.path.basename((payload.get("cwd") or "").rstrip("/")) or "Claude Code"
+    try:
+        toast_summary(title, body, cfg["toast"]["summary_timeout_seconds"],
+                      cfg["toast"]["corner"], footer=tline)
+    except Exception as e:
+        debug(f"summary toast failed: {e}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_ask(a) -> int:
+    cfg = load_config()
+    buttons = [b for b in a.buttons.split(",") if b] or ["OK"]
+    timeout = a.timeout if a.timeout is not None else cfg["toast"]["ask_timeout_seconds"]
+    corner = a.corner or cfg["toast"]["corner"]
+    slot = acquire_slot()
+    try:
+        rc, label = toast_ask(a.title, a.message, buttons, timeout, corner, slot,
+                              hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                              kind=a.kind, project=a.project)
+    except FileNotFoundError as e:
+        print(f"noti: {e}", file=sys.stderr)
+        return 1
+    finally:
+        release_slot(slot)
+    if label:
+        print(label)
+    return rc
+
+
+def cmd_notify(a) -> int:
+    cfg = load_config()
+    timeout = a.timeout if a.timeout is not None else cfg["toast"]["summary_timeout_seconds"]
+    try:
+        toast_summary(a.title, a.body, timeout, a.corner or cfg["toast"]["corner"],
+                      kind=a.kind, footer=a.footer)
+    except FileNotFoundError as e:
+        print(f"noti: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_hook(a) -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as e:
+        debug(f"bad stdin: {e}")
+        return 0                                  # can't parse -> never block
+    try:
+        if a.event == "pretooluse":
+            return hook_pretooluse(payload)
+        if a.event == "stop":
+            return hook_stop(payload)
+    except Exception as e:
+        debug(f"hook crash: {e}")                 # a noti bug must not break the session
+        return 0
+    return 0
+
+
+def cmd_decide(a) -> int:
+    """Dry-run the policy on a PreToolUse JSON from stdin. Never shows a toast."""
+    payload = json.load(sys.stdin)
+    print(json.dumps(evaluate(payload, load_config()), indent=2))
+    return 0
+
+
+def cmd_build(a) -> int:
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        print("error: swiftc not found. Install Xcode Command Line Tools: xcode-select --install",
+              file=sys.stderr)
+        return 1
+    BINARY.parent.mkdir(parents=True, exist_ok=True)
+    print(f"building {BINARY} ...")
+    r = subprocess.run([swiftc, "-O", str(SWIFT_SRC), "-o", str(BINARY)])
+    if r.returncode == 0:
+        print("ok")
+    return r.returncode
+
+
+def _hook_block(payload_cmd: str, matcher=None, timeout=None):
+    entry = {"hooks": [{"type": "command", "command": payload_cmd}]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    if timeout is not None:
+        entry["hooks"][0]["timeout"] = timeout
+    return entry
+
+
+def cmd_install(a) -> int:
+    if not BINARY.exists() and cmd_build(a) != 0:
+        return 1
+    cfg = load_config()
+    if a.project:
+        target = Path(a.project).resolve() / ".claude" / "settings.json"
+    else:
+        target = Path.home() / ".claude" / "settings.json"
+
+    py = shlex.quote(sys.executable or "python3")
+    script = shlex.quote(str(Path(__file__).resolve()))
+    pre_cmd = f"{py} {script} hook pretooluse"
+    stop_cmd = f"{py} {script} hook stop"
+    matcher = "|".join(cfg["approval"]["governed_tools"]) + ("|mcp__.*" if cfg["approval"]["govern_mcp"] else "")
+    pre_timeout = int(cfg["toast"]["ask_timeout_seconds"]) + 30
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            with open(target) as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"error: {target} is not valid JSON ({e}); fix it before installing.", file=sys.stderr)
+            return 1
+        if not isinstance(data, dict):
+            print(f"error: {target} is not a JSON object.", file=sys.stderr)
+            return 1
+    else:
+        data = {}
+    hooks = data.setdefault("hooks", {})
+
+    def already(event):
+        return any("noti" in h.get("command", "")
+                   for blk in hooks.get(event, []) for h in blk.get("hooks", []))
+
+    if already("PreToolUse") or already("Stop"):
+        print("noti hooks already present — nothing to do (run `noti uninstall` first to refresh).")
+        return 0
+
+    if target.exists():                                   # back up only when we're actually writing
+        backup = target.with_suffix(f".json.noti-backup-{int(time.time())}")
+        shutil.copy2(target, backup)
+        print(f"backed up {target} -> {backup}")
+
+    hooks.setdefault("PreToolUse", []).append(_hook_block(pre_cmd, matcher=matcher, timeout=pre_timeout))
+    hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
+    atomic_write_json(target, data)
+    print(f"installed noti hooks into {target}")
+    print(f"  PreToolUse matcher: {matcher}")
+    print("Start a new `claude` session (or /hooks reload) for it to take effect.")
+    return 0
+
+
+def cmd_uninstall(a) -> int:
+    target = (Path(a.project).resolve() / ".claude" / "settings.json") if a.project \
+        else Path.home() / ".claude" / "settings.json"
+    data = read_json(target, None)
+    if not data or "hooks" not in data:
+        print(f"no hooks in {target}")
+        return 0
+    removed = 0
+    for event in ("PreToolUse", "Stop"):
+        blocks = data["hooks"].get(event, [])
+        kept = []
+        for blk in blocks:
+            if any("noti" in h.get("command", "") for h in blk.get("hooks", [])):
+                removed += 1
+            else:
+                kept.append(blk)
+        if kept:
+            data["hooks"][event] = kept
+        else:
+            data["hooks"].pop(event, None)
+    atomic_write_json(target, data)
+    print(f"removed {removed} noti hook block(s) from {target}")
+    return 0
+
+
+def cmd_doctor(a) -> int:
+    ok = True
+    def line(label, good, detail=""):
+        nonlocal ok
+        ok = ok and good
+        print(f"  [{'OK' if good else '!!'}] {label}{(' — ' + detail) if detail else ''}")
+
+    print("noti doctor")
+    line("swiftc available", shutil.which("swiftc") is not None, shutil.which("swiftc") or "missing")
+    line("toast binary built", BINARY.exists(), str(BINARY))
+    g = Path.home() / ".claude" / "settings.json"
+    gd = read_json(g, {}) or {}
+    has = any("noti" in h.get("command", "")
+              for blk in gd.get("hooks", {}).get("PreToolUse", []) for h in blk.get("hooks", []))
+    line("hooks installed (global)", has, "run `noti install` to wire up" if not has else str(g))
+    cfg = load_config()
+    print(f"  governed: {', '.join(cfg['approval']['governed_tools'])}"
+          f"{' + mcp__*' if cfg['approval']['govern_mcp'] else ''}")
+    print(f"  ask timeout: {cfg['toast']['ask_timeout_seconds']}s · rule scope: {cfg['approval']['rule_scope']}")
+    return 0 if ok else 1
+
+
+def cmd_version(a) -> int:
+    print("noti 0.2.0")
+    return 0
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="noti", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("ask", help="blocking Yes/Always/No toast (prints label, exit=index)")
+    a.add_argument("--title", default="")
+    a.add_argument("--message", default="")
+    a.add_argument("--buttons", default="Yes,No")
+    a.add_argument("--timeout", type=float, default=None)
+    a.add_argument("--corner", default=None)
+    a.add_argument("--kind", default="", help="run|edit|fetch|mcp|note — dot color + mono message")
+    a.add_argument("--project", default="", help="eyebrow line above the title")
+    a.set_defaults(fn=cmd_ask)
+
+    n = sub.add_parser("notify", help="non-blocking auto-dismissing summary toast")
+    n.add_argument("--title", default="")
+    n.add_argument("--body", default="")
+    n.add_argument("--timeout", type=float, default=None)
+    n.add_argument("--corner", default=None)
+    n.add_argument("--kind", default="note", help="dot color: run|edit|fetch|mcp|note")
+    n.add_argument("--footer", default="", help="small monospaced footer line")
+    n.set_defaults(fn=cmd_notify)
+
+    h = sub.add_parser("hook", help="Claude Code hook adapter (reads JSON on stdin)")
+    h.add_argument("event", choices=["pretooluse", "stop"])
+    h.set_defaults(fn=cmd_hook)
+
+    d = sub.add_parser("decide", help="dry-run the policy on stdin JSON (no toast)")
+    d.set_defaults(fn=cmd_decide)
+
+    b = sub.add_parser("build", help="compile the Swift toast binary")
+    b.set_defaults(fn=cmd_build)
+
+    i = sub.add_parser("install", help="wire up the Claude Code hooks")
+    grp = i.add_mutually_exclusive_group()
+    grp.add_argument("--global", dest="glob", action="store_true", help="install into ~/.claude (default)")
+    grp.add_argument("--project", metavar="DIR", help="install into DIR/.claude instead")
+    i.set_defaults(fn=cmd_install)
+
+    u = sub.add_parser("uninstall", help="remove the noti hooks")
+    u.add_argument("--project", metavar="DIR")
+    u.set_defaults(fn=cmd_uninstall)
+
+    sub.add_parser("doctor", help="check install state").set_defaults(fn=cmd_doctor)
+    sub.add_parser("version", help="print version").set_defaults(fn=cmd_version)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if not hasattr(args, "project"):
+        args.project = None
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
