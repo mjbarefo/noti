@@ -21,6 +21,8 @@ files: `noti` (Python 3, the policy engine + hook adapter + CLI) and
 - `NOTI_DEBUG=1` + `~/.config/noti/noti.log` — hook debugging
 - `ruff check noti` — lint the Python (brew ruff or `./.venv/bin/ruff`; config in
   `ruff.toml`). The `noti` CLI has no `.py` extension, so name it explicitly.
+- `make hooks` — enable the pre-commit gate (`.githooks/pre-commit`: lint + full
+  test suite). Run once per clone.
 
 ## Live-install gotcha
 

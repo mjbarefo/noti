@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Gate every commit on the policy tests + lint. The global Claude Code hooks
+# run this working copy live — never commit a broken policy engine.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+RUFF=./.venv/bin/ruff
+[ -x "$RUFF" ] || RUFF=ruff
+"$RUFF" check noti
+
+./test.sh
