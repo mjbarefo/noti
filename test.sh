@@ -3,6 +3,19 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Hermetic environment. `noti decide` resolves allow/deny rules from HOME's and
+# the payload cwd's .claude/settings — so without isolation the suite reads the
+# developer's ambient rules (a github.com allow rule in a gitignored
+# .claude/settings.local.json is why the "allowed domain" test passed locally but
+# failed on a clean CI runner). Point HOME and CWD at a fixture that supplies
+# exactly the rule the tests assert, so results are identical everywhere.
+FIX="$(mktemp -d)"
+export HOME="$FIX"
+export XDG_CONFIG_HOME="$FIX/.config"
+mkdir -p "$FIX/.claude"
+printf '%s\n' '{"permissions":{"allow":["WebFetch(domain:github.com)"]}}' > "$FIX/.claude/settings.json"
+trap 'rm -rf "$FIX"' EXIT
+
 pass=0; fail=0
 check() {  # check "name" "<json>" "<expected action>"
   local got
@@ -14,7 +27,7 @@ check() {  # check "name" "<json>" "<expected action>"
   fi
 }
 
-CWD=$(pwd)
+CWD="$FIX"
 j() { printf '{"tool_name":"%s","tool_input":%s,"permission_mode":"%s","cwd":"%s","session_id":"test"}' "$1" "$2" "$3" "$CWD"; }
 
 echo "noti policy tests"
