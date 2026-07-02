@@ -35,6 +35,34 @@ No multiplexer, no panes, no persistent server. You keep using whatever terminal
 you already run `claude` in; noti just injects itself at those two points via
 Claude Code hooks.
 
+## What it looks like
+
+<table>
+<tr>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/approval-dark.png"><img alt="Approval toast with Yes / Always / No buttons" src="docs/approval-light.png" width="360"></picture><br>
+<sub><b>Approval</b> — run a command, edit a file, call an MCP tool</sub>
+</td>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/question-dark.png"><img alt="Question toast whose buttons are the options" src="docs/question-light.png" width="360"></picture><br>
+<sub><b>Question</b> — the buttons <em>are</em> the answer options</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/plan-dark.png"><img alt="Plan toast with Approve / View buttons" src="docs/plan-light.png" width="360"></picture><br>
+<sub><b>Plan</b> — Approve, or View the full plan in the terminal</sub>
+</td>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/summary-dark.png"><img alt="End-of-turn summary toast with a tool tally" src="docs/summary-light.png" width="360"></picture><br>
+<sub><b>Summary</b> — the trimmed final message + a tool tally</sub>
+</td>
+</tr>
+</table>
+
+<sub>Cards follow the system light/dark palette (shown here in both); the icon
+chip's tint is the risk class, its glyph the tool.</sub>
+
 ## How it works
 
 ```
