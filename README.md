@@ -155,3 +155,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 - Hotkeys require one mouse motion over the toast to arm — that's deliberate
   (see safety notes), but it means there's no fully hands-off keyboard answer.
 - macOS only.
+
+## License
+
+[MIT](LICENSE) © 2026 Jacob Barefoot.
