@@ -76,10 +76,14 @@ DEFAULT_CONFIG = {
         # metacharacters). Keep this list genuinely read-only.
         # Genuinely read-only verbs only. NOT env/find/rg — those can exec or
         # delete without any shell metacharacter (env <prog>, find -delete, rg --pre).
+        # NOT `git branch` — bare listing is niche and the prefix also covers the
+        # mutating `git branch NAME` / `-D` / `-m`. NOT `tree` — its `-o FILE`
+        # writes a file and the short flag can't be blocked without also blocking
+        # `grep -o` (see _BASH_DANGEROUS_FLAGS).
         "bash_safe_commands": [
             "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
-            "git branch", "git show", "which", "head", "tail", "wc", "date",
-            "whoami", "grep", "tree",
+            "git show", "which", "head", "tail", "wc", "date",
+            "whoami", "grep",
         ],
         # "exact" (safe: rule matches only this command) | "prefix" (broader)
         "bash_always_mode": "exact",
@@ -400,8 +404,17 @@ _BASH_META = set("$`;|&<>(){}\n")
 # Flags that turn an otherwise read-only verb into a write/delete/exec. A safe
 # verb carrying any of these is NOT auto-allowed — defence-in-depth in case the
 # safelist is ever widened (e.g. someone re-adds find or rg via config).
+#   --output / --ext-diff: git log/diff/show honour these — `git diff
+#     --output=FILE` writes an arbitrary path, `--ext-diff` runs an external
+#     diff driver. Only the long forms are listed: git has no short `-o`, and a
+#     bare `-o` would collide with `grep -o` (read-only, and safe-listed).
+# The check is token-based (see is_safe_bash): it catches `--output FILE` and
+# `--output=FILE`, but NOT a value glued to a short flag (e.g. `-oFILE`). That
+# residual is why a command whose only write vector is a short flag (tree -o) is
+# dropped from the safe-list outright rather than relying on flag-blocking.
 _BASH_DANGEROUS_FLAGS = ("-exec", "-execdir", "-delete", "-fls", "-fprint",
-                         "-fprintf", "-ok", "-okdir", "--pre", "--search-zip")
+                         "-fprintf", "-ok", "-okdir", "--pre", "--search-zip",
+                         "--output", "--ext-diff")
 
 # MCP method tokens that imply a state change or code execution — block auto-allow
 # if any appears anywhere in the method name.

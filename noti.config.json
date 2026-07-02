@@ -13,8 +13,8 @@
     "govern_mcp": true,
     "bash_safe_commands": [
       "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
-      "git branch", "git show", "which", "head", "tail", "wc", "date",
-      "whoami", "grep", "tree"
+      "git show", "which", "head", "tail", "wc", "date",
+      "whoami", "grep"
     ],
     "bash_always_mode": "exact",
     "mcp_autoallow_servers": [],

@@ -33,6 +33,8 @@ check "read mcp prompts (opt-in off)" "$(j mcp__claude_ai_Gmail__search_threads 
 check "mutating mcp prompts"        "$(j mcp__claude_ai_Gmail__create_draft '{}' default)"    prompt
 check "env bash NOT auto-allowed"   "$(j Bash '{"command":"env rm -rf /tmp/x"}' default)"     prompt
 check "find -delete NOT allowed"    "$(j Bash '{"command":"find . -delete"}' default)"        prompt
+check "git --output NOT auto-allowed" "$(j Bash '{"command":"git log --output=/tmp/x"}' default)" prompt
+check "git branch NAME NOT auto-allowed" "$(j Bash '{"command":"git branch evil"}' default)"  prompt
 check "dontAsk mode defers"         "$(j Bash '{"command":"rm -rf build"}' dontAsk)"          defer
 check "auto mode still governs"     "$(j Bash '{"command":"rm -rf build"}' auto)"             prompt
 
@@ -87,6 +89,18 @@ want("find -delete not safe",    not m.is_safe_bash("find . -delete", cfg))
 want("rg --pre not safe",        not m.is_safe_bash("rg --pre x foo .", cfg))
 want("git status still safe",        m.is_safe_bash("git status", cfg))
 want("grep -o still safe",           m.is_safe_bash("grep -o foo bar", cfg))
+
+# v0.4 F9: git write/exec flags on a safe verb are NOT auto-allowed (file clobber / exec)
+want("git log --output= not safe",   not m.is_safe_bash("git log --output=/tmp/x", cfg))
+want("git diff --output not safe",   not m.is_safe_bash("git diff --output /tmp/x", cfg))
+want("git show --output= not safe",  not m.is_safe_bash("git show --output=/tmp/x HEAD", cfg))
+want("git diff --ext-diff not safe", not m.is_safe_bash("git diff --ext-diff", cfg))
+# ...but the long-form --output block must NOT over-reach to grep's read-only -o
+want("grep -o not over-blocked",         m.is_safe_bash("grep -o foo bar", cfg))
+# v0.4 F10: mutating `git branch NAME/-D` and niche `tree -o` dropped from the safe-list
+want("git branch NAME not safe",     not m.is_safe_bash("git branch evil", cfg))
+want("git branch -D not safe",       not m.is_safe_bash("git branch -D main", cfg))
+want("tree -o not safe",             not m.is_safe_bash("tree -o /tmp/x", cfg))
 
 # F2: an exact Bash 'Always' rule must NOT glob-broaden
 want("exact rule matches itself",      m.pattern_matches("Bash", {"command":"rm -rf node_modules/*"}, "Bash(rm -rf node_modules/*)"))
