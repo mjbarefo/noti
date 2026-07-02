@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+VERSION = "0.3.0"
+
 HERE = Path(__file__).resolve().parent
 BINARY = HERE / "bin" / "noti-toast"
 SWIFT_SRC = HERE / "bin" / "noti-toast.swift"
@@ -1046,7 +1048,7 @@ def cmd_doctor(a) -> int:
         ok = ok and good
         print(f"  [{'OK' if good else '!!'}] {label}{(' — ' + detail) if detail else ''}")
 
-    print("noti doctor")
+    print(f"noti doctor — v{VERSION}")
     line("swiftc available", shutil.which("swiftc") is not None, shutil.which("swiftc") or "missing")
     line("toast binary built", BINARY.exists(), str(BINARY))
     g = Path.home() / ".claude" / "settings.json"
@@ -1071,7 +1073,7 @@ def cmd_doctor(a) -> int:
 
 
 def cmd_version(a) -> int:
-    print("noti 0.3.0")
+    print(f"noti {VERSION}")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1083,9 @@ def cmd_version(a) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="noti", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    # top-level --version fires during parse (before the required-subcommand
+    # check), so `noti --version` works without naming a subcommand
+    p.add_argument("--version", action="version", version=f"noti {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("ask", help="blocking Yes/Always/No toast (prints label, exit=index)")
