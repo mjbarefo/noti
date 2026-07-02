@@ -1108,36 +1108,40 @@ def cmd_install(a) -> int:
     pre_timeout = int(cfg["toast"]["ask_timeout_seconds"]) + 30
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        try:
-            with open(target) as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"error: {target} is not valid JSON ({e}); fix it before installing.", file=sys.stderr)
-            return 1
-        if not isinstance(data, dict):
-            print(f"error: {target} is not a JSON object.", file=sys.stderr)
-            return 1
-    else:
-        data = {}
-    hooks = data.setdefault("hooks", {})
+    # Hold the same lock write_rule uses: an 'Always' click in a live session
+    # mutates this file too, and an unlocked read-modify-write here could drop one
+    # of the two updates (last writer wins).
+    with locked("rules.lock"):
+        if target.exists():
+            try:
+                with open(target) as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"error: {target} is not valid JSON ({e}); fix it before installing.", file=sys.stderr)
+                return 1
+            if not isinstance(data, dict):
+                print(f"error: {target} is not a JSON object.", file=sys.stderr)
+                return 1
+        else:
+            data = {}
+        hooks = data.setdefault("hooks", {})
 
-    def already(event):
-        return any("noti" in h.get("command", "")
-                   for blk in hooks.get(event, []) for h in blk.get("hooks", []))
+        def already(event):
+            return any("noti" in h.get("command", "")
+                       for blk in hooks.get(event, []) for h in blk.get("hooks", []))
 
-    if already("PreToolUse") or already("Stop"):
-        print("noti hooks already present — nothing to do (run `noti uninstall` first to refresh).")
-        return 0
+        if already("PreToolUse") or already("Stop"):
+            print("noti hooks already present — nothing to do (run `noti uninstall` first to refresh).")
+            return 0
 
-    if target.exists():                                   # back up only when we're actually writing
-        backup = target.with_suffix(f".json.noti-backup-{int(time.time())}")
-        shutil.copy2(target, backup)
-        print(f"backed up {target} -> {backup}")
+        if target.exists():                               # back up only when we're actually writing
+            backup = target.with_suffix(f".json.noti-backup-{int(time.time())}")
+            shutil.copy2(target, backup)
+            print(f"backed up {target} -> {backup}")
 
-    hooks.setdefault("PreToolUse", []).append(_hook_block(pre_cmd, matcher=matcher, timeout=pre_timeout))
-    hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
-    atomic_write_json(target, data)
+        hooks.setdefault("PreToolUse", []).append(_hook_block(pre_cmd, matcher=matcher, timeout=pre_timeout))
+        hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
+        atomic_write_json(target, data)
     print(f"installed noti hooks into {target}")
     print(f"  PreToolUse matcher: {matcher}")
     print("Start a new `claude` session (or /hooks reload) for it to take effect.")
