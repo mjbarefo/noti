@@ -55,10 +55,19 @@ with **zero dependencies** and no special macOS permissions — it doesn't steal
 focus or switch Spaces. The policy + hook glue is one dependency-free Python
 file (`noti`).
 
+## Requirements
+
+macOS 11 (Big Sur) or newer, on **Apple Silicon or Intel** — `./noti build`
+produces a universal binary. You need the Xcode Command Line Tools
+(`xcode-select --install`) for the one-time build; nothing else. noti is stdlib
+Python 3 plus one small AppKit Swift binary, with **zero third-party
+dependencies** — no package manager, no runtime to install.
+
 ## Quick start
 
 ```bash
-./noti build          # compile the Swift toast binary (needs Xcode CLT)
+git clone https://github.com/mjbarefo/noti && cd noti
+./noti build          # compile the universal toast binary (needs Xcode CLT)
 ./noti doctor         # check state
 ./test.sh             # run the policy tests (no GUI)
 
@@ -73,6 +82,12 @@ file (`noti`).
 ```
 
 After installing, start a fresh `claude` session for the hooks to load.
+
+**The clone is the install.** noti's hooks run this working copy in place — there
+is no separate copy under `~`. Keep the clone where it is; to upgrade, `git pull
+&& ./noti build`. If you move or delete it, sessions simply fall back to Claude's
+own terminal prompt (noti fails open, never blocks), and `./noti doctor` will
+flag that the installed hook points at a clone that's no longer there.
 
 ## Reusable primitives
 

@@ -30,6 +30,7 @@ import fcntl
 import fnmatch
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -40,6 +41,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 VERSION = "0.3.0"
+# Deployment-target floor for the toast binary. The host toolchain default-
+# targets the build machine's OS (e.g. macosx15), which would stamp a minos the
+# binary refuses to launch under on older Macs — so `noti build` pins this
+# explicitly. 11.0 is the floor for the SF Symbol + continuous-corner AppKit
+# APIs bin/noti-toast.swift uses (targeting 10.15 raises availability errors).
+MACOS_FLOOR = "11.0"
 
 HERE = Path(__file__).resolve().parent
 BINARY = HERE / "bin" / "noti-toast"
@@ -971,6 +978,18 @@ def cmd_decide(a) -> int:
     return 0
 
 
+def _binary_archs(path: Path):
+    """Arch slices in a Mach-O binary, via `lipo -archs`. [] if unknowable."""
+    lipo = shutil.which("lipo")
+    if not lipo or not path.exists():
+        return []
+    try:
+        r = subprocess.run([lipo, "-archs", str(path)], capture_output=True, text=True)
+        return r.stdout.split() if r.returncode == 0 else []
+    except Exception:
+        return []
+
+
 def cmd_build(a) -> int:
     swiftc = shutil.which("swiftc")
     if not swiftc:
@@ -978,11 +997,47 @@ def cmd_build(a) -> int:
               file=sys.stderr)
         return 1
     BINARY.parent.mkdir(parents=True, exist_ok=True)
-    print(f"building {BINARY} ...")
-    r = subprocess.run([swiftc, "-O", str(SWIFT_SRC), "-o", str(BINARY)])
-    if r.returncode == 0:
-        print("ok")
-    return r.returncode
+    pid = os.getpid()
+    scratch = []                       # every temp we make, cleaned no matter what
+
+    def compile_to(target: str, tag: str):
+        out = BINARY.with_name(f".noti-toast.{tag}.{pid}")
+        scratch.append(out)
+        ok = subprocess.run([swiftc, "-O", "-target", target,
+                             str(SWIFT_SRC), "-o", str(out)]).returncode == 0
+        return out if ok else None
+
+    def finish(built: Path) -> int:
+        # atomic swap: the LIVE binary is never a half-written file a hook execs
+        os.replace(built, BINARY)
+        print(f"ok — {BINARY} [{' '.join(_binary_archs(BINARY)) or 'single-arch'}]")
+        return 0
+
+    try:
+        print(f"building {BINARY} (universal, macOS {MACOS_FLOOR}+) ...")
+        slices = [compile_to(f"{arch}-apple-macosx{MACOS_FLOOR}", arch)
+                  for arch in ("arm64", "x86_64")]
+        lipo = shutil.which("lipo")
+        if all(slices) and lipo:
+            fat = BINARY.with_name(f".noti-toast.fat.{pid}")
+            scratch.append(fat)
+            if subprocess.run([lipo, "-create", *[str(s) for s in slices],
+                               "-o", str(fat)]).returncode == 0:
+                return finish(fat)
+        # Fallback: a toolchain that can't cross-compile (missing arch SDK slice
+        # or no lipo) still gets a working binary — native-only, but pinned to
+        # the same floor. Never leave the user without a toast binary.
+        host = platform.machine() or "x86_64"
+        print(f"note: universal build unavailable — building {host}-only.", file=sys.stderr)
+        native = compile_to(f"{host}-apple-macosx{MACOS_FLOOR}", "native")
+        if native:
+            return finish(native)
+        print("error: swift build failed.", file=sys.stderr)
+        return 1
+    finally:
+        for t in scratch:
+            with contextlib.suppress(Exception):
+                Path(t).unlink(missing_ok=True)
 
 
 def _hook_block(payload_cmd: str, matcher=None, timeout=None):
@@ -1076,6 +1131,21 @@ def cmd_uninstall(a) -> int:
     return 0
 
 
+def _mac_ge(ver: str, floor: str) -> bool:
+    """True if macOS version string `ver` is at least `floor` (major.minor).
+    Unknown/unparseable → True, so doctor never raises a spurious floor alarm."""
+    def parse(s):
+        out = []
+        for p in s.split(".")[:2]:
+            try:
+                out.append(int(p))
+            except ValueError:
+                return None
+        return (tuple(out) + (0, 0))[:2] if out else None
+    a, b = parse(ver), parse(floor)
+    return True if a is None or b is None else a >= b
+
+
 def cmd_doctor(a) -> int:
     ok = True
     def line(label, good, detail=""):
@@ -1084,21 +1154,63 @@ def cmd_doctor(a) -> int:
         print(f"  [{'OK' if good else '!!'}] {label}{(' — ' + detail) if detail else ''}")
 
     print(f"noti doctor — v{VERSION}")
+
+    # 1. Host floor — noti is macOS-only and the toast APIs need macOS 11+.
+    mac = platform.mac_ver()[0]
+    line(f"macOS >= {MACOS_FLOOR}", _mac_ge(mac, MACOS_FLOOR), mac or "not macOS")
+    pv = sys.version_info
+    line("python >= 3.9", (pv.major, pv.minor) >= (3, 9), f"{pv.major}.{pv.minor}.{pv.micro}")
+    line("~/.claude present", (Path.home() / ".claude").is_dir(), str(Path.home() / ".claude"))
+
+    # 2. Toolchain + binary. Arch mismatch is the failure a stranger hits after
+    #    copying someone else's build (Intel binary on Apple Silicon, or vice
+    #    versa); a binary older than its source means a stale `./noti build`.
     line("swiftc available", shutil.which("swiftc") is not None, shutil.which("swiftc") or "missing")
-    line("toast binary built", BINARY.exists(), str(BINARY))
+    line("toast binary built", BINARY.exists(), str(BINARY) if BINARY.exists() else "run `./noti build`")
+    if BINARY.exists():
+        archs, host = _binary_archs(BINARY), platform.machine()
+        line("binary runs on this arch", (not archs) or host in archs,
+             f"{' '.join(archs) or 'unknown'} · host {host}"
+             + ("" if (not archs or host in archs) else " — run `./noti build`"))
+        if SWIFT_SRC.exists():
+            stale = BINARY.stat().st_mtime < SWIFT_SRC.stat().st_mtime
+            line("binary up to date", not stale,
+                 "source newer than binary — run `./noti build`" if stale else "")
+
+    # 3. Hooks — installed, pointing at a live clone (this one), matcher current.
     g = Path.home() / ".claude" / "settings.json"
     gd = read_json(g, {}) or {}
-    has = any("noti" in h.get("command", "")
-              for blk in gd.get("hooks", {}).get("PreToolUse", []) for h in blk.get("hooks", []))
+    pre = gd.get("hooks", {}).get("PreToolUse", [])
+    noti_cmd = next((h.get("command", "") for blk in pre for h in blk.get("hooks", [])
+                     if "noti" in h.get("command", "")), "")
+    has = bool(noti_cmd)
     line("hooks installed (global)", has, "run `noti install` to wire up" if not has else str(g))
     cfg = load_config()
     if has:
+        # The installed hook runs a specific `noti` script path. A moved/deleted
+        # clone leaves that path dangling (hooks fail OPEN, so silently — doctor
+        # is the only place it surfaces); a path into a DIFFERENT clone means
+        # this doctor run isn't describing what actually executes.
+        try:
+            toks = shlex.split(noti_cmd)
+        except Exception:
+            toks = noti_cmd.split()
+        script = next((t for t in toks if os.path.basename(t) == "noti"), "")
+        sp = Path(script) if script else None
+        alive = bool(sp) and sp.exists()
+        line("hook script exists", alive,
+             "" if alive else
+             f"{script or 'no script path in hook'} — clone moved/deleted; `noti install` from its new home")
+        if alive:
+            here = (HERE / "noti").resolve()
+            line("hook runs this clone", sp.resolve() == here,
+                 f"hooks run {sp.resolve()}, not this clone" if sp.resolve() != here else "")
         # an install predating question/plan surfacing has a matcher that
         # filters those events out before noti ever runs — flag the drift
-        m = next((blk.get("matcher", "") for blk in gd.get("hooks", {}).get("PreToolUse", [])
-                  if any("noti" in h.get("command", "") for h in blk.get("hooks", []))), "")
-        stale = (cfg["approval"].get("surface_questions", True) and "AskUserQuestion" not in m) or \
-                (cfg["approval"].get("surface_plans", True) and "ExitPlanMode" not in m)
+        matcher = next((blk.get("matcher", "") for blk in pre
+                        if any("noti" in h.get("command", "") for h in blk.get("hooks", []))), "")
+        stale = (cfg["approval"].get("surface_questions", True) and "AskUserQuestion" not in matcher) or \
+                (cfg["approval"].get("surface_plans", True) and "ExitPlanMode" not in matcher)
         line("hook matcher current", not stale,
              "matcher predates question/plan surfacing — `noti uninstall && noti install`" if stale else "")
     print(f"  governed: {', '.join(cfg['approval']['governed_tools'])}"
