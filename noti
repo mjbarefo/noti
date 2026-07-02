@@ -540,10 +540,21 @@ def render_plan(tinput: dict) -> dict:
 def evaluate(payload: dict, cfg: dict) -> dict:
     """Pure decision. Returns dict with action in
     {allow, deny, defer, prompt} (+ reason / title / message)."""
-    tool = payload.get("tool_name", "")
-    tinput = payload.get("tool_input", {}) or {}
-    mode = payload.get("permission_mode", "default")
-    cwd = payload.get("cwd") or os.getcwd()
+    # Coerce every field to the type the rest of the function assumes. Claude
+    # Code's hook JSON shape has shifted across versions, and a stranger may run
+    # an older/newer build: a non-dict tool_input or non-str tool_name must
+    # DEGRADE per-decision (defer to Claude's own flow), never traceback. The
+    # hook path already fails open, but keeping evaluate() itself total means
+    # `noti decide` and any future caller stay robust too.
+    if not isinstance(payload, dict):
+        return {"action": "defer", "reason": "noti: malformed payload"}
+    tool = payload.get("tool_name")
+    tool = tool if isinstance(tool, str) else ""
+    tinput = payload.get("tool_input")
+    tinput = tinput if isinstance(tinput, dict) else {}
+    mode = payload.get("permission_mode") or "default"
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd else os.getcwd()
 
     # 0. Claude-to-human interaction tools are not permission gates — they're
     #    the session waiting on a person (a question to answer, a plan to

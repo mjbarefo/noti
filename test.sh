@@ -232,6 +232,25 @@ d5 = m.evaluate({"tool_name": "ExitPlanMode", "tool_input": {"plan": "x"},
                  "permission_mode": "plan", "cwd": sys.argv[1]}, offcfg)
 want("surface_plans=false defers", d5["action"] == "defer")
 
+# v0.4: evaluate() is TOTAL against malformed / forward-incompatible payloads.
+# Claude Code's hook JSON has shifted across versions and a stranger may run an
+# older/newer build — every odd shape must DEGRADE (defer, or a safe prompt),
+# never traceback. A raise here would (in the hook path) fail open, but keeping
+# the pure function total protects `noti decide` and any future caller.
+CWD = sys.argv[1]
+def ev(p):
+    return m.evaluate(p, cfg)["action"]
+want("non-dict payload defers",        ev("not a dict") == "defer")
+want("non-str tool_name defers",       ev({"tool_name": 123, "tool_input": {}, "cwd": CWD}) == "defer")
+want("missing tool_name defers",       ev({"tool_input": {"command": "ls"}, "cwd": CWD}) == "defer")
+want("non-dict tool_input -> prompt",  ev({"tool_name": "Bash", "tool_input": "rm -rf /", "cwd": CWD}) == "prompt")
+want("list tool_input -> prompt",      ev({"tool_name": "Bash", "tool_input": [1, 2], "cwd": CWD}) == "prompt")
+want("missing permission_mode allows safe", ev({"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": CWD}) == "allow")
+want("missing cwd doesn't crash",      ev({"tool_name": "Bash", "tool_input": {"command": "git status"}}) == "allow")
+want("questions as dict -> notice",    ev({"tool_name": "AskUserQuestion", "tool_input": {"questions": {"x": 1}}, "cwd": CWD}) == "notice")
+want("options as bare strings -> question", ev({"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Q?", "options": ["A", "B"]}]}, "cwd": CWD}) == "question")
+want("bash without command -> prompt", ev({"tool_name": "Bash", "tool_input": {}, "cwd": CWD}) == "prompt")
+
 sys.exit(1 if bad else 0)
 PY
 sec=$?
