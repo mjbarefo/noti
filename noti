@@ -58,6 +58,11 @@ LOG_FILE = CONFIG_HOME / "noti.log"
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
+# tool_input sub-fields consumed as strings downstream (.strip / .startswith /
+# urlparse). evaluate() normalizes a non-string one to "" so a forward-
+# incompatible payload can't traceback the pure decision path.
+_TINPUT_STR_FIELDS = ("command", "file_path", "notebook_path", "url")
+
 DEFAULT_CONFIG = {
     "toast": {
         "corner": "top-right",
@@ -575,9 +580,23 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     tool = tool if isinstance(tool, str) else ""
     tinput = payload.get("tool_input")
     tinput = tinput if isinstance(tinput, dict) else {}
+    # The known scalar sub-fields feed .strip()/.startswith()/urlparse downstream
+    # (is_safe_bash, pattern_matches, make_rule). A non-string one — e.g. a
+    # forward-incompatible build sending `command` as a number — would traceback,
+    # so normalize them here (copy, don't mutate the caller's dict). `questions`
+    # and other structured fields are left as-is; their renderers already guard.
+    if any(not isinstance(tinput.get(k), (str, type(None))) for k in _TINPUT_STR_FIELDS):
+        tinput = {k: ("" if k in _TINPUT_STR_FIELDS and not isinstance(v, str) else v)
+                  for k, v in tinput.items()}
     mode = payload.get("permission_mode") or "default"
-    cwd = payload.get("cwd")
-    cwd = cwd if isinstance(cwd, str) and cwd else os.getcwd()
+    cwd_raw = payload.get("cwd")
+    cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw else os.getcwd()
+    # When the payload omits cwd, os.getcwd() is a guess, not the session's project
+    # dir — a relative/project-anchored ALLOW rule would then anchor to the wrong
+    # base and could auto-allow a path a deny rule (mis-anchored the same way) was
+    # meant to block. Real Claude Code always sends cwd; when it's missing we
+    # simply don't honour path-anchored allow rules (fall through to a prompt).
+    cwd_known = isinstance(cwd_raw, str) and bool(cwd_raw)
 
     # 0. Claude-to-human interaction tools are not permission gates — they're
     #    the session waiting on a person (a question to answer, a plan to
@@ -624,8 +643,11 @@ def evaluate(payload: dict, cfg: dict) -> dict:
 
     # 5. Already allowed (Claude's rules or a prior 'Always') -> allow silently.
     #    NB: must be 'allow', not 'defer' — in default mode a defer would surface
-    #    Claude's own terminal prompt, defeating the toast.
-    if matches_any(tool, tinput, load_patterns(cwd, "allow"), cwd):
+    #    Claude's own terminal prompt, defeating the toast. Gated on a known cwd:
+    #    a path-anchored allow rule resolved against a guessed cwd could out-vote a
+    #    deny rule mis-anchored the same way, so when cwd is absent we don't
+    #    auto-allow via rules (fall through to a prompt — the safe direction).
+    if cwd_known and matches_any(tool, tinput, load_patterns(cwd, "allow"), cwd):
         return {"action": "allow", "reason": "noti: already allowed"}
 
     # 6. Conservative auto-allow surfaces.

@@ -262,6 +262,23 @@ want("missing cwd doesn't crash",      ev({"tool_name": "Bash", "tool_input": {"
 want("questions as dict -> notice",    ev({"tool_name": "AskUserQuestion", "tool_input": {"questions": {"x": 1}}, "cwd": CWD}) == "notice")
 want("options as bare strings -> question", ev({"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Q?", "options": ["A", "B"]}]}, "cwd": CWD}) == "question")
 want("bash without command -> prompt", ev({"tool_name": "Bash", "tool_input": {}, "cwd": CWD}) == "prompt")
+# v0.4 F13 (HIGH): a non-string nested tool_input field must not crash the pure
+# path — it degrades to a safe prompt, not a traceback (previously AttributeError)
+want("int command -> prompt (no crash)", ev({"tool_name": "Bash", "tool_input": {"command": 123}, "cwd": CWD}) == "prompt")
+want("list file_path -> prompt (no crash)", ev({"tool_name": "Write", "tool_input": {"file_path": ["x"]}, "cwd": CWD}) == "prompt")
+want("dict url -> prompt (no crash)",    ev({"tool_name": "WebFetch", "tool_input": {"url": {"x": 1}}, "cwd": CWD}) == "prompt")
+# v0.4 F14 (MEDIUM): with cwd absent, a path-anchored allow rule must NOT auto-
+# allow (it could out-vote a deny mis-anchored to the same guessed cwd)
+_save2 = m.load_patterns
+m.load_patterns = lambda cwd, kind: (["Edit(//tmp/anywhere/secret.txt)"] if kind == "allow" else [])
+try:
+    want("no-cwd path allow does not auto-allow",
+         m.evaluate({"tool_name": "Write", "tool_input": {"file_path": "/tmp/anywhere/secret.txt"}}, cfg)["action"] == "prompt")
+    want("known-cwd path allow still allows",
+         m.evaluate({"tool_name": "Write", "tool_input": {"file_path": "/tmp/anywhere/secret.txt"},
+                     "cwd": CWD}, cfg)["action"] == "allow")
+finally:
+    m.load_patterns = _save2
 
 sys.exit(1 if bad else 0)
 PY
