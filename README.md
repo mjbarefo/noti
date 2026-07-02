@@ -161,8 +161,16 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   Claude's normal permission flow on any error, and never exits non-zero.
 - The Bash auto-allow list is a real security surface — it fires only for the
   listed read-only verbs, refuses shell metacharacters (`; | & $ \` ( ) < >`), and
-  refuses write/exec/delete flags (`-exec`, `-delete`, `--pre`, …). `env`, `find`,
-  and `rg` are deliberately excluded (they can exec/delete without metacharacters).
+  refuses write/exec/delete flags (`-exec`, `-delete`, `--output`, `--ext-diff`,
+  `--pre`, …). `env`, `find`, `rg`, `git branch`, and `tree` are deliberately
+  excluded — each can write, exec, or mutate without a shell metacharacter
+  (`env <prog>`, `find -delete`, `rg --pre`, `git branch NAME`, `tree -o FILE`).
+- The listed read verbs still *read* whatever path they're handed, so a
+  safe-listed `cat ~/.ssh/id_rsa` or `grep secret ~/.aws/credentials` auto-allows
+  with no toast. That's read-only by the tool's definition — there's no exfil
+  without a shell metacharacter, which is already blocked — but it's a deliberate
+  design choice: if you'd rather be asked before secrets are read, drop `cat` /
+  `grep` from `bash_safe_commands`.
 - MCP auto-allow is **opt-in**: by default every governed MCP call prompts. Add a
   server to `mcp_autoallow_servers` to silence its read-only calls; mutating method
   names still prompt.
@@ -170,6 +178,14 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   (including question/plan surfacing). In `dontAsk` mode noti never shows a
   *permission* toast (you asked not to be asked) — questions and plans still
   surface, because the session blocks on them regardless of permission mode.
+- noti enforces deny/allow rules from your **user** (`~/.claude/settings.json`) and
+  **project** (`.claude/settings.json`, `.claude/settings.local.json`) settings —
+  the same files Claude Code merges. It does **not** read enterprise *managed*
+  settings (`/Library/Application Support/ClaudeCode/managed-settings.json`): a
+  deny rule that lives only there is invisible to noti, so a safe-listed read-only
+  command could auto-allow despite it. If your org relies on managed-policy denies,
+  set `approval.bash_safe_commands: []` (and leave MCP auto-allow off) so every
+  command reaches Claude's own enforcement.
 - Answering a question from the toast uses the PreToolUse `updatedInput` channel
   with the **exact** question/option strings. A Claude Code too old to support
   it simply ignores the field and asks in the terminal — degraded, never a
@@ -194,9 +210,11 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   the documented rule forms — `Bash(cmd)`, `Bash(cmd:*)`, `Bash(cmd *)`, path
   anchors (`//abs`, `~/home`, `/project-root`, relative), `WebFetch(domain:…)`,
   `mcp__server`, `mcp__server__tool`, and `mcp__server__get_*` wildcards — but
-  where they diverge it errs strict: a bare trailing `*` in a Bash rule is
-  matched literally, not as a prefix (worst case: noti toasts on something
-  Claude would have auto-allowed).
+  where they diverge it errs on the *safe* side, which is directional. For an
+  **allow** rule a bare trailing `*` in a Bash pattern is matched literally, not
+  as a prefix (worst case: noti toasts on something Claude would have
+  auto-allowed). For a **deny** rule the same `*` is treated as a prefix, so noti
+  can never *under*-match a deny and let something slip through the auto-allow.
 - Hotkeys require one mouse motion over the toast to arm — that's deliberate
   (see safety notes), but it means there's no fully hands-off keyboard answer.
 - macOS only.
