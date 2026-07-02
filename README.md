@@ -14,11 +14,13 @@ surfaces only the moments a human is actually needed:
    **y / a / n** (Esc = fall back to the terminal prompt). A hairline drains
    along the bottom edge — when it empties, the prompt moves to the terminal.
 2. **Questions & plans** — when Claude asks a multiple-choice question
-   (`AskUserQuestion`), a single simple question becomes a toast whose buttons
-   *are* the options: one click answers it (the hook returns the answer via
-   `updatedInput`, so the terminal picker never appears). Multi-question,
-   multi-select, or 4+-option sets get a non-blocking heads-up toast instead —
-   the terminal UI (option descriptions, free-text "Other") owns those. When a
+   (`AskUserQuestion`), a single question with 2–4 options becomes a toast that
+   renders them as a numbered list — full labels, each with its description —
+   the same shape as the terminal picker, so pressing **1/2/3/4** (or one
+   click) answers it (the hook returns the answer via `updatedInput`, and the
+   terminal picker never appears). Multi-question or multi-select sets get a
+   non-blocking heads-up toast instead — the terminal UI (full descriptions,
+   free-text "Other") owns those, and Esc on any question card hands off to it. When a
    plan is ready (`ExitPlanMode`), the toast shows a preview with
    **Approve / View**: Approve accepts the plan (implementation still goes
    through approval toasts); View, Esc, or timeout hands you the full plan UI
@@ -44,8 +46,8 @@ Claude Code hooks.
 <sub><b>Approval</b> — run a command, edit a file, call an MCP tool</sub>
 </td>
 <td align="center" width="50%">
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/question-dark.png"><img alt="Question toast whose buttons are the options" src="docs/question-light.png" width="360"></picture><br>
-<sub><b>Question</b> — the buttons <em>are</em> the answer options</sub>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/question-dark.png"><img alt="Question toast rendering the options as a numbered list with descriptions" src="docs/question-light.png" width="360"></picture><br>
+<sub><b>Question</b> — options as a numbered list; click or press <b>1/2/3/4</b></sub>
 </td>
 </tr>
 <tr>
@@ -74,8 +76,8 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
                                                                     ├ No ───▶ deny
                                                                     └ (timeout) ▶ ask  (fall back to
                                                                                  Claude's terminal prompt)
-                 AskUserQuestion ─▶ options as buttons ─▶ answer via updatedInput
-                                    (complex sets: heads-up toast, answer in terminal)
+                 AskUserQuestion ─▶ numbered option list ─▶ answer via updatedInput
+                                    (multi-question/-select: heads-up toast, answer in terminal)
                  ExitPlanMode ────▶ Approve ─▶ allow  ·  View/timeout ─▶ terminal plan UI
 Stop hook ──────▶ trimmed last message + tool tally ─▶ non-blocking summary toast
 ```
@@ -196,8 +198,11 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 - Answering a question from the toast uses the PreToolUse `updatedInput` channel
   with the **exact** question/option strings. A Claude Code too old to support
   it simply ignores the field and asks in the terminal — degraded, never a
-  wrong answer. Anything the toast can't represent faithfully (multi-select,
-  4+ options, free-text "Other") is never answered from the toast at all.
+  wrong answer. The toast shows display *copies* of the labels (sanitized,
+  length-capped) but always answers with the raw strings by index, so display
+  trimming can never change what Claude hears. Anything the toast can't
+  represent faithfully (multi-select, several questions at once, 5+ options,
+  free-text "Other") is never answered from the toast at all.
 - **Hotkeys are hover-armed.** The toast only captures the keyboard after the
   mouse *moves* over it, and releases it the moment the mouse leaves. A toast
   appearing while you type — even directly under a parked cursor — can never

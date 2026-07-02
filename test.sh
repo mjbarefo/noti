@@ -56,7 +56,8 @@ check "simple question toasts"      "$(j AskUserQuestion '{"questions":[{"questi
 check "question surfaces in bypass" "$(j AskUserQuestion '{"questions":[{"question":"Proceed?","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}' bypassPermissions)" question
 check "multiSelect question notifies" "$(j AskUserQuestion '{"questions":[{"question":"Pick features","options":[{"label":"A"},{"label":"B"}],"multiSelect":true}]}' default)" notice
 check "multi-question notifies"     "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"}]}]}' default)" notice
-check "4-option question notifies"  "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"}]}]}' default)" notice
+check "4-option question toasts"    "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"}]}]}' default)" question
+check "5-option question notifies"  "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"},{"label":"E"}]}]}' default)" notice
 check "plan review toasts (plan mode)" "$(j ExitPlanMode '{"plan":"# Plan\n1. do the thing"}' plan)" plan
 
 echo
@@ -256,6 +257,95 @@ offcfg = copy.deepcopy(cfg); offcfg["approval"]["surface_plans"] = False
 d5 = m.evaluate({"tool_name": "ExitPlanMode", "tool_input": {"plan": "x"},
                  "permission_mode": "plan", "cwd": sys.argv[1]}, offcfg)
 want("surface_plans=false defers", d5["action"] == "defer")
+
+# v0.5: the option-list layout must never damage answer integrity.
+# Descriptions ride index-aligned with options; unknown option keys (real
+# transcripts carry "preview" payloads with multi-line ASCII art) never leak;
+# display copies are sanitized so the \x1f field separator can't misalign a
+# row against its exit-code index.
+q2 = {"questions": [{"question": "Which release flow?",
+                     "header": "Release",
+                     "options": [{"label": "Commits + v0.4.0 tag (Recommended)",
+                                  "description": "Tag the release now.",
+                                  "preview": "ASCII-ART\nJUNK\x1fPAYLOAD"},
+                                 {"label": "Commits + both tags",
+                                  "description": "Tag v0.4.0 and v0.5.0."},
+                                 "Bare string option"],
+                     "multiSelect": False}]}
+d6 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q2,
+                 "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+want("question w/ descriptions toasts", d6["action"] == "question")
+want("options keep exact raw strings",
+     d6["options"] == ["Commits + v0.4.0 tag (Recommended)", "Commits + both tags",
+                       "Bare string option"])
+want("descriptions index-aligned (bare option = '')",
+     d6["descriptions"] == ["Tag the release now.", "Tag v0.4.0 and v0.5.0.", ""])
+want("unknown option keys never leak", all("ASCII-ART" not in str(v) for v in d6.values()))
+want("argv buttons stay stale-binary safe",
+     d6["buttons"] == [m.trunc(m._display_line(o), 16) for o in d6["options"]])
+
+# critic HIGH: a whitespace/control-only label sanitizes to an empty
+# NOTI_OPTIONS field, and ONE empty field would kick the whole card off the
+# list layout onto the 3-button fallback — silently hiding a real 4th option.
+# The degenerate option must be dropped alone, everything real kept.
+qws = {"questions": [{"question": "Pick one",
+                      "options": [{"label": "Alpha"},
+                                  {"label": " ", "description": "ghost"},
+                                  {"label": "\x01\x02"},
+                                  {"label": "Delta (Recommended)"}],
+                      "multiSelect": False}]}
+dws = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": qws,
+                  "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+want("degenerate labels dropped, real options kept",
+     dws["action"] == "question" and dws["options"] == ["Alpha", "Delta (Recommended)"])
+want("descriptions realigned after the drop", dws["descriptions"] == ["", ""])
+want("no empty NOTI_OPTIONS field can reach the binary",
+     all(f for f in m._toast_env(5, None, "top-right",
+                                 options=dws["options"])["NOTI_OPTIONS"].split("\x1f")))
+
+want("_display_line strips controls", m._display_line("a\x1fb\nc\x00d") == "a b c d")
+envd = m._toast_env(5, None, "top-right",
+                    options=["x\x1fy", "b"], descs=["d1\x1fd2", ""])
+want("embedded \\x1f can't misalign options", envd["NOTI_OPTIONS"] == "x y\x1fb")
+want("embedded \\x1f can't misalign descs",   envd["NOTI_DESCS"] == "d1 d2\x1f")
+want("desc arity mismatch not sent",
+     "NOTI_DESCS" not in m._toast_env(5, None, "top-right", options=["a", "b"], descs=["only-one"]))
+
+# a stray exported NOTI_OPTIONS must never flip a permission prompt into the
+# list layout with labels noti never chose
+os.environ["NOTI_OPTIONS"] = "evil\x1fpayload"; os.environ["NOTI_DESCS"] = "x\x1fy"
+try:
+    env2 = m._toast_env(5, None, "top-right")
+    want("inherited NOTI_OPTIONS/DESCS scrubbed",
+         "NOTI_OPTIONS" not in env2 and "NOTI_DESCS" not in env2)
+finally:
+    del os.environ["NOTI_OPTIONS"]; del os.environ["NOTI_DESCS"]
+
+# answer round-trip at the new 4-option arity: exit code 3 -> EXACT 4th option
+# via updatedInput; esc/timeout (124) and junk exit codes emit NO decision
+import io, contextlib
+q4 = {"questions": [{"question": "Pick one?",
+                     "options": [{"label": "Alpha"}, {"label": "Beta"},
+                                 {"label": "Gamma"}, {"label": "Delta (Recommended)"}],
+                     "multiSelect": False}]}
+d7 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q4,
+                 "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+_save_ask = m.toast_ask
+def _run_prompt(rc):
+    m.toast_ask = lambda *a, **k: (rc, "")
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            m.prompt_question({"tool_name": "AskUserQuestion", "tool_input": q4,
+                               "session_id": "t", "cwd": sys.argv[1]}, cfg, dict(d7))
+    finally:
+        m.toast_ask = _save_ask
+    return buf.getvalue()
+out3 = _run_prompt(3)
+want("rc=3 answers with exact 4th option",
+     '"Delta (Recommended)"' in out3 and '"permissionDecision": "allow"' in out3)
+want("rc=124 (esc/timeout) emits no decision", _run_prompt(124).strip() == "")
+want("junk exit code emits no decision", _run_prompt(7).strip() == "")
 
 # v0.4: evaluate() is TOTAL against malformed / forward-incompatible payloads.
 # Claude Code's hook JSON has shifted across versions and a stranger may run an

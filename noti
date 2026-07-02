@@ -182,6 +182,16 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
+def _display_line(s: str) -> str:
+    # Display copy for \x1f-joined env fields (NOTI_OPTIONS / NOTI_DESCS):
+    # control chars — including the separator itself — can never survive, so
+    # the Swift-side split can never misalign a row's text against its
+    # exit-code index. A description under the wrong option would be an
+    # answer-integrity bug; answers themselves round-trip the exact strings
+    # in the decision dict, never these copies.
+    return " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", s).split())
+
+
 def home_short(p: str) -> str:
     try:
         return "~/" + str(Path(p).resolve().relative_to(Path.home()))
@@ -193,8 +203,20 @@ def home_short(p: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
-               kind: str = "", project: str = "", footer: str = "") -> dict:
+               kind: str = "", project: str = "", footer: str = "",
+               options=None, descs=None) -> dict:
     env = dict(os.environ)
+    # Scrub BEFORE conditionally setting: dict(os.environ) inherits the parent
+    # env, and a stray exported NOTI_OPTIONS would flip a permission prompt
+    # into the option-list layout with labels noti never chose.
+    env.pop("NOTI_OPTIONS", None)
+    env.pop("NOTI_DESCS", None)
+    if options:
+        # full option labels for the vertical list layout; argv still carries
+        # the truncated fallbacks so a stale binary renders the classic card
+        env["NOTI_OPTIONS"] = "\x1f".join(trunc(_display_line(o), 120) for o in options)
+        if descs and len(descs) == len(options) and any(descs):
+            env["NOTI_DESCS"] = "\x1f".join(trunc(_display_line(x), 200) for x in descs)
     env["NOTI_TIMEOUT"] = str(timeout)
     env["NOTI_CORNER"] = corner
     env["NOTI_HOTKEYS"] = "1" if hotkeys else "0"
@@ -213,14 +235,15 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
 
 
 def toast_ask(title, message, buttons, timeout, corner, slot, hotkeys=True,
-              kind="", project=""):
+              kind="", project="", options=None, descriptions=None, footer=""):
     """Blocking. Returns (returncode, label). returncode 124 == timed out."""
     if not BINARY.exists():
         raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
     proc = subprocess.run(
         [str(BINARY), "ask", title, message, *buttons],
         capture_output=True, text=True,
-        env=_toast_env(timeout, slot, corner, hotkeys, kind, project),
+        env=_toast_env(timeout, slot, corner, hotkeys, kind, project, footer,
+                       options=options, descs=descriptions),
     )
     return proc.returncode, proc.stdout.strip()
 
@@ -525,19 +548,31 @@ def render_call(tool: str, tinput: dict):
 
 
 def render_question(tinput: dict) -> dict:
-    """AskUserQuestion -> decision dict. One single-select question with 2-3
-    options becomes a 'question' toast whose buttons ARE the options — the
-    common case, answered without touching the terminal. Anything richer
-    (several questions, multiSelect, 4+ options — and the terminal UI also
-    owns free-text "Other") becomes a non-blocking 'notice' so the human
-    knows the session is waiting on them."""
+    """AskUserQuestion -> decision dict. One single-select question with 2-4
+    options becomes a 'question' toast rendered as a vertical option list —
+    full labels with their descriptions, answered without touching the
+    terminal. Anything richer (several questions, multiSelect, 5+ options —
+    and the terminal UI also owns free-text "Other") becomes a non-blocking
+    'notice' so the human knows the session is waiting on them."""
     qs = [q for q in (tinput.get("questions") or []) if isinstance(q, dict)]
     if len(qs) == 1 and not qs[0].get("multiSelect"):
         q = qs[0]
-        options = [o.get("label", "") if isinstance(o, dict) else str(o)
-                   for o in (q.get("options") or [])]
-        options = [o for o in options if o]
-        if 2 <= len(options) <= 3:
+        # harvest labels + descriptions in ONE loop so they stay index-aligned
+        # (the toast's exit code indexes both). Read only the two known keys:
+        # real transcripts carry nonstandard extras ("preview" with multi-line
+        # ASCII art) that must never reach a toast.
+        options, descs = [], []
+        for o in (q.get("options") or []):
+            label = str(o.get("label") or "") if isinstance(o, dict) else str(o)
+            # filter on the SANITIZED form, not truthiness: a whitespace- or
+            # control-char-only label collapses to an empty NOTI_OPTIONS field,
+            # and one empty field would knock the whole card off the list
+            # layout onto the 3-button fallback — silently hiding a real
+            # 4th option. Drop just the degenerate option instead.
+            if _display_line(label):
+                options.append(label)
+                descs.append(str(o.get("description") or "") if isinstance(o, dict) else "")
+        if 2 <= len(options) <= 4:
             header = str(q.get("header") or "").strip()
             return {"action": "question",
                     "title": f"Claude asks — {header}" if header else "Claude asks",
@@ -547,7 +582,11 @@ def render_question(tinput: dict) -> dict:
                     # option label, or Claude Code won't recognise the answer
                     "question": str(q.get("question") or ""),
                     "options": options,
-                    "buttons": [trunc(o, 16) for o in options]}
+                    "descriptions": descs,
+                    # argv fallbacks for a stale binary (which prefix(3)s
+                    # them); the list layout reads NOTI_OPTIONS instead.
+                    # Buttons are pure display — sanitized copy there too.
+                    "buttons": [trunc(_display_line(o), 16) for o in options]}
     n = len(qs)
     first = trunc(str(qs[0].get("question") or ""), 160) if qs else ""
     return {"action": "notice", "kind": "question",
@@ -803,7 +842,12 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
         rc, _ = toast_ask(d["title"], d["message"], d["buttons"],
                           cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
                           hotkeys=bool(cfg["toast"].get("hotkeys", True)),
-                          kind="question", project=d.get("project", ""))
+                          kind="question", project=d.get("project", ""),
+                          # full labels + descriptions ride in env for the list
+                          # layout; the footer advertises the terminal escape
+                          # hatch (descriptions in full, free-text "Other")
+                          options=d.get("options"), descriptions=d.get("descriptions"),
+                          footer="esc · answer in terminal")
     except Exception as e:
         debug(f"question toast failed: {e}")
         return 0

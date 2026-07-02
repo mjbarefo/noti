@@ -29,7 +29,15 @@
 //                 the message in monospace (terminal text is the material),
 //                 question/plan stay prose
 //   NOTI_PROJECT  eyebrow line above the title (which session is asking)
-//   NOTI_FOOTER   small monospaced footer line (summary: the tool tally)
+//   NOTI_FOOTER   small monospaced footer line (summary: the tool tally;
+//                 ask: rendered in list mode only — the esc hint)
+//   NOTI_OPTIONS  full option labels, joined with the unit separator \u{1f} —
+//                 2..4 non-empty fields flip the ask card into a vertical
+//                 option list (question cards). argv still carries truncated
+//                 fallback buttons, so an old binary renders the classic row.
+//   NOTI_DESCS    per-option descriptions, \u{1f}-joined, same arity as
+//                 NOTI_OPTIONS. An arity mismatch drops ALL descriptions — a
+//                 description under the wrong option is worse than none.
 //   NOTI_APPEARANCE  light | dark — force a palette (snapshot/design review
 //                 aid; live toasts follow the system)
 //
@@ -53,6 +61,13 @@
 //     don't know is partial, is how mistakes happen.
 //   * The ask card's bottom hairline drains over NOTI_TIMEOUT: when it empties,
 //     the prompt falls back to the terminal. The deadline is never a surprise.
+//   * Question cards (NOTI_OPTIONS set) render options as a VERTICAL NUMBERED
+//     LIST — the same shape as Claude Code's terminal picker, so "press 1..4"
+//     muscle memory transfers. Labels render in full (2-line wrap, real "…"),
+//     each with its description beneath. No option is styled as the default
+//     and Return is deliberately inert on these cards: options are semantic
+//     peers, and an invisible default is how a reflexive keystroke submits an
+//     answer the user never chose. Esc still hands off to the terminal.
 //   * Hotkeys are HOVER-ARMED: the panel only grabs the keyboard after the mouse
 //     *moves* over it. A toast appearing under a parked cursor, or while you're
 //     typing in the terminal, can never swallow a keystroke — so an in-flight
@@ -375,11 +390,22 @@ func snapshotIfRequested(_ vev: NSView) {
 // Click handlers
 // ----------------------------------------------------------------------------
 
+// Anything the user can pick on an ask card. The horizontal ToastButton and
+// the list-mode OptionRow share firing, arming, and the answer contract:
+// stdout = label, exit code = tag = option index (the Python side maps the
+// index back to the EXACT option string, so display text is never the answer).
+protocol Choice: AnyObject {
+    var label: String { get }
+    var key: String { get }
+    func fire()
+    func setArmed(_ armed: Bool)
+}
+
 final class Handler: NSObject {
     @objc func tap(_ sender: Any?) {
-        guard let b = sender as? ToastButton else { exit(70) }
+        guard let b = sender as? (NSControl & Choice) else { exit(70) }
         FileHandle.standardOutput.write(Data((b.label + "\n").utf8))
-        exit(Int32(b.tag))                     // exit code == button index
+        exit(Int32(b.tag))                     // exit code == option index
     }
     @objc func dismiss(_ sender: Any?) {
         exit(0)                                // summary: click anywhere to dismiss
@@ -395,7 +421,7 @@ final class Handler: NSObject {
 // this" without a legend.
 // ----------------------------------------------------------------------------
 
-final class ToastButton: NSControl {
+final class ToastButton: NSControl, Choice {
     let label: String
     let key: String                    // hotkey character ("" = none shown)
     private let primary: Bool
@@ -488,6 +514,125 @@ final class ToastButton: NSControl {
 }
 
 // ----------------------------------------------------------------------------
+// OptionRow — one full-width option in the list-mode ask card. The leading
+// digit keycap doubles as the list numeral, so it stays visible even with
+// hotkeys disabled (the ordinal is content, not just an affordance — it just
+// never brightens, because no key monitor is installed). No terracotta, no
+// "primary" row: an AskUserQuestion's options are semantic peers, and styling
+// one as the default is how a reflexive keystroke picks the wrong answer.
+// Labels wrap to 2 lines and descriptions clamp to 2, both through the same
+// cell machinery as the message label, so any clip shows a real "…".
+// ----------------------------------------------------------------------------
+
+final class OptionRow: NSControl, Choice {
+    let label: String                  // full display label — stdout on click
+    let key: String                    // digit hotkey; always drawn as numeral
+    private var capBox: NSView?
+    private var fill: NSColor { NSColor.labelColor.withAlphaComponent(0.08) }
+    private var hoverFill: NSColor { NSColor.labelColor.withAlphaComponent(0.14) }
+
+    static let labelFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+    static let descFont  = NSFont.systemFont(ofSize: 11)
+    static let capSize: CGFloat = 18
+    static let textX: CGFloat = 10 + capSize + 8      // keycap gutter
+
+    init(title: String, desc: String, key: String, tag: Int, width: CGFloat,
+         target: AnyObject?, action: Selector) {
+        self.label = title
+        self.key = key
+        let textW = width - OptionRow.textX - 10
+        let (labelH, labelLines) = measure(title, font: OptionRow.labelFont,
+                                           width: textW, maxLines: 2)
+        let (descH, descLines): (CGFloat, Int) = desc.isEmpty ? (0, 0)
+            : measure(desc, font: OptionRow.descFont, width: textW, maxLines: 2)
+        let h = max(30, 8 + labelH + (descH > 0 ? 2 + descH : 0) + 8)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: h))
+        self.tag = tag
+        self.target = target
+        self.action = action
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
+        layer?.backgroundColor = fill.cgColor
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(desc.isEmpty ? title : "\(title), \(desc)")
+
+        // mirrors the global label() helper's multiline branch — can't call it
+        // here because the Choice `label` property shadows the function name
+        func textField(_ s: String, font: NSFont, color: NSColor,
+                       frame: NSRect, lines: Int) -> NSTextField {
+            let t = NSTextField(labelWithString: s)
+            t.frame = frame
+            t.font = font
+            t.textColor = color
+            t.maximumNumberOfLines = lines
+            t.lineBreakMode = .byWordWrapping
+            t.cell?.wraps = true
+            t.cell?.truncatesLastVisibleLine = true
+            t.cell?.isScrollable = false
+            return t
+        }
+
+        // keycap centers against the FIRST label line, not the row: a row with
+        // a 2-line description must not divorce the numeral from its label
+        let lineH = measure("Mg", font: OptionRow.labelFont, width: textW, maxLines: 1).height
+        let cap = NSView(frame: NSRect(x: 10, y: h - 8 - lineH / 2 - OptionRow.capSize / 2,
+                                       width: OptionRow.capSize, height: OptionRow.capSize))
+        cap.wantsLayer = true
+        cap.layer?.cornerRadius = 5
+        cap.layer?.cornerCurve = .continuous
+        cap.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.10).cgColor
+        let k = NSTextField(labelWithString: key)
+        k.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        k.textColor = .secondaryLabelColor
+        k.alignment = .center
+        k.frame = NSRect(x: 0, y: 2, width: OptionRow.capSize, height: 14)
+        cap.addSubview(k)
+        capBox = cap
+        addSubview(cap)
+
+        addSubview(textField(title, font: OptionRow.labelFont, color: .labelColor,
+                             frame: NSRect(x: OptionRow.textX, y: h - 8 - labelH,
+                                           width: textW, height: labelH),
+                             lines: labelLines))
+        if descH > 0 {
+            addSubview(textField(desc, font: OptionRow.descFont, color: .secondaryLabelColor,
+                                 frame: NSRect(x: OptionRow.textX,
+                                               y: h - 8 - labelH - 2 - descH,
+                                               width: textW, height: descH),
+                                 lines: descLines))
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // numerals brighten when the card arms — same "keyboard is live" signal
+    // as ToastButton's keycaps
+    func setArmed(_ armed: Bool) {
+        capBox?.layer?.backgroundColor =
+            NSColor.labelColor.withAlphaComponent(armed ? 0.20 : 0.10).cgColor
+    }
+
+    func fire() {
+        if let action { NSApp.sendAction(action, to: target, from: self) }
+    }
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways],
+                                       owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { layer?.backgroundColor = hoverFill.cgColor }
+    override func mouseExited(with event: NSEvent)  { layer?.backgroundColor = fill.cgColor }
+    override func mouseDown(with event: NSEvent)    { alphaValue = 0.7 }
+    override func mouseUp(with event: NSEvent) {
+        alphaValue = 1
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { fire() }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Modes
 // ----------------------------------------------------------------------------
 
@@ -496,29 +641,59 @@ switch mode {
 case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     let title   = args.count > 1 ? args[1] : ""
     let message = args.count > 2 ? args[2] : ""
+    // prefix(3) is deliberate: four fallback buttons overflow the 560pt cap.
+    // 4-option cards always arrive via NOTI_OPTIONS (Python guarantees every
+    // field non-empty, so a current binary never falls back for them); only a
+    // pre-list binary caps a 4-option question at 3, with Esc -> terminal
+    // still offering everything.
     let buttons = Array(args.dropFirst(3)).isEmpty ? ["OK"] : Array(args.dropFirst(3).prefix(3))
     let hotkeys = (env["NOTI_HOTKEYS"] ?? "1") != "0"
     let kind    = env["NOTI_KIND"] ?? ""
     let project = env["NOTI_PROJECT"] ?? ""
+    let footer  = env["NOTI_FOOTER"] ?? ""
+
+    // List mode: NOTI_OPTIONS carries the FULL option labels (\u{1f}-joined);
+    // argv keeps truncated fallbacks so a stale binary renders the classic
+    // card. Anything malformed — wrong arity, an empty label — falls back to
+    // the horizontal row: fail-open lives in the UI too.
+    func usFields(_ v: String?) -> [String] {
+        guard let v, !v.isEmpty else { return [] }
+        return v.components(separatedBy: "\u{1f}")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+    let optLabels = usFields(env["NOTI_OPTIONS"])
+    let listMode = (2...4).contains(optLabels.count) && optLabels.allSatisfy { !$0.isEmpty }
+    var optDescs = usFields(env["NOTI_DESCS"])
+    if optDescs.count != optLabels.count {
+        // never guess pairings: a description under the wrong option is an
+        // answer-integrity bug, so an arity mismatch drops them all
+        optDescs = Array(repeating: "", count: optLabels.count)
+    }
 
     // hotkey per button = its first letter; duplicates keep first-wins and the
-    // later button shows no keycap (still clickable)
+    // later button shows no keycap (still clickable). List mode uses digits
+    // 1..N — the terminal picker's numbering, collision-proof by construction
+    // (and drawn even with hotkeys off: the numeral is the list's ordinal)
     var seen = Set<String>()
-    let keys: [String] = buttons.map {
-        let k = String($0.lowercased().prefix(1))
-        return (hotkeys && !k.isEmpty && seen.insert(k).inserted) ? k : ""
-    }
+    let keys: [String] = listMode
+        ? (1...optLabels.count).map(String.init)
+        : buttons.map {
+            let k = String($0.lowercased().prefix(1))
+            return (hotkeys && !k.isEmpty && seen.insert(k).inserted) ? k : ""
+        }
 
     // measure buttons first: custom labels via the `noti ask` CLI may need a
     // wider card than the stock Yes/Always/No (which fits in 360)
-    let btnWidths: [CGFloat] = zip(buttons, keys).map {
+    let btnWidths: [CGFloat] = listMode ? [] : zip(buttons, keys).map {
         ToastButton.width(title: $0, showKey: !$1.isEmpty)
     }
     let btnRowW = btnWidths.reduce(0, +) + CGFloat(max(0, buttons.count - 1)) * 8
 
     let pad: CGFloat = 16
     let chip: CGFloat = 26                     // banner anatomy: icon chip leads
-    let W: CGFloat = min(560, max(360, btnRowW + 2 * pad))
+    // list cards are fixed-width — rows wrap to the card, never the card to
+    // the rows — sized between the 360 summary and the 560 ask cap
+    let W: CGFloat = listMode ? 420 : min(560, max(360, btnRowW + 2 * pad))
     let textW = W - 2 * pad
     let headX = pad + chip + 10                // text block sits beside the chip
     let headW = W - headX - pad
@@ -532,11 +707,30 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     let eyeH: CGFloat = project.isEmpty ? 0 : lineHeight(eyebrowFont)
     let titleH = lineHeight(titleFont)
     let headerH = max(chip, eyeH + (eyeH > 0 ? 3 : 0) + titleH)
+    // list mode trims the question to 4 lines: Python caps it at 220 chars
+    // (≈3.6 lines at this width), so nothing real is lost and the option rows
+    // get the room
     let (msgH, msgLines): (CGFloat, Int) =
-        message.isEmpty ? (0, 0) : measure(message, font: msgFont, width: textW, maxLines: 5)
+        message.isEmpty ? (0, 0) : measure(message, font: msgFont, width: textW,
+                                           maxLines: listMode ? 4 : 5)
 
-    var H: CGFloat = 14 + headerH + 12 + ToastButton.height + 14
+    let handler = Handler()
+    var rows: [OptionRow] = []
+    if listMode {
+        for (i, lab) in optLabels.enumerated() {
+            rows.append(OptionRow(title: lab, desc: optDescs[i], key: keys[i], tag: i,
+                                  width: textW, target: handler,
+                                  action: #selector(Handler.tap(_:))))
+        }
+    }
+    let rowsH = rows.reduce(0) { $0 + $1.frame.height } + CGFloat(max(0, rows.count - 1)) * 6
+    let footerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    let footerH: CGFloat = (listMode && !footer.isEmpty) ? lineHeight(footerFont) : 0
+
+    var H: CGFloat = listMode ? 14 + headerH + 12 + rowsH + 14
+                              : 14 + headerH + 12 + ToastButton.height + 14
     if msgH > 0 { H += 9 + msgH }
+    if footerH > 0 { H += 8 + footerH }
 
     let (panel, vev) = makeCard(width: W, height: H)
     let headerBottom = H - 14 - headerH
@@ -560,17 +754,32 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
                                            width: textW, height: msgH), maxLines: msgLines))
     }
 
-    let handler = Handler()
-    var buttonViews: [ToastButton] = []
-    var x = W - pad
-    for (i, name) in buttons.enumerated() {
-        let b = ToastButton(title: name, key: keys[i], primary: i == 0,
-                            tag: i, target: handler, action: #selector(Handler.tap(_:)))
-        x -= btnWidths[i]
-        b.setFrameOrigin(NSPoint(x: x, y: 14))
-        x -= 8
-        vev.addSubview(b)
-        buttonViews.append(b)
+    var choices: [NSControl & Choice] = []
+    if listMode {
+        var yTop = (msgH > 0 ? headerBottom - 9 - msgH : headerBottom) - 12
+        for r in rows {
+            r.setFrameOrigin(NSPoint(x: pad, y: yTop - r.frame.height))
+            vev.addSubview(r)
+            choices.append(r)
+            yTop -= r.frame.height + 6
+        }
+        if footerH > 0 {
+            // yTop sits one 6pt gap below the last row; the footer wants 8pt
+            vev.addSubview(label(footer, font: footerFont, color: .tertiaryLabelColor,
+                                 frame: NSRect(x: pad, y: yTop + 6 - 8 - footerH,
+                                               width: textW, height: footerH)))
+        }
+    } else {
+        var x = W - pad
+        for (i, name) in buttons.enumerated() {
+            let b = ToastButton(title: name, key: keys[i], primary: i == 0,
+                                tag: i, target: handler, action: #selector(Handler.tap(_:)))
+            x -= btnWidths[i]
+            b.setFrameOrigin(NSPoint(x: x, y: 14))
+            x -= 8
+            vev.addSubview(b)
+            choices.append(b)
+        }
     }
 
     if hotkeys {
@@ -581,12 +790,12 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             panel.makeKey()
             // arming must be visible — the user needs to know the keyboard is live
             vev.layer?.borderColor = claude.withAlphaComponent(0.9).cgColor
-            buttonViews.forEach { $0.setArmed(true) }
+            choices.forEach { $0.setArmed(true) }
         }
         vev.onLeave = {
             armed = false
             vev.layer?.borderColor = hairline.cgColor
-            buttonViews.forEach { $0.setArmed(false) }
+            choices.forEach { $0.setArmed(false) }
             // orderOut + re-orderFront reliably hands key focus back to the
             // frontmost app; resignKey() alone leaves the keyboard in limbo
             panel.orderOut(nil)
@@ -595,11 +804,18 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
             guard armed else { return ev }
             if ev.keyCode == 53 { exit(124) }                            // esc = no answer
-            if ev.keyCode == 36 { buttonViews.first?.fire(); return nil }  // return
+            if ev.keyCode == 36 {
+                // Return approves (Yes / Approve) on the classic row. A
+                // question's options are peers: an invisible default is how
+                // a reflexive Return submits an answer the user never chose,
+                // so on list cards it's deliberately inert
+                if !listMode { choices.first?.fire() }
+                return nil
+            }
             if ev.modifierFlags.intersection([.command, .control, .option]).isEmpty,
                let ch = ev.charactersIgnoringModifiers?.lowercased(), !ch.isEmpty {
-                for b in buttonViews where b.key == ch {
-                    b.fire()
+                for c in choices where c.key == ch {
+                    c.fire()
                     return nil
                 }
             }

@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Question cards render options as a vertical numbered list** instead of a
+  horizontal button row. Labels show in full (2-line wrap with a real ellipsis)
+  rather than truncated to 16 characters, each option's *description* renders
+  beneath it for the first time, and the hotkeys are now **1–4** — the terminal
+  picker's own numbering, immune to the first-letter collisions that left
+  similar options without a keycap. A footer advertises the Esc → terminal
+  escape hatch. Calibrated against real transcript data (median label 21 chars,
+  p95 36; descriptions present on 100% of options).
+- Single-select questions with **4 options now toast** (previously only 2–3;
+  4-option questions were a quarter of real usage). Multi-question,
+  multi-select, and 5+ option sets still get the heads-up notice.
+- Return is deliberately inert on question cards: options are peers, and an
+  invisible default is how a reflexive keystroke submits an answer the user
+  never chose. Return still means Yes/Approve on permission and plan cards.
+
+### Internal
+- Full option labels and descriptions ride to the binary in `NOTI_OPTIONS` /
+  `NOTI_DESCS` (unit-separator-joined, control chars sanitized so a crafted
+  label can never misalign a row against its exit-code index). argv still
+  carries the truncated fallback buttons, so a stale binary renders the classic
+  card; answers keep round-tripping the exact raw strings by index either way.
+  New regression tests cover alignment, env scrubbing, the 4-option answer
+  round-trip, and the 5-option boundary.
+
 ## [0.4.0] — 2026-07-02
 
 The "someone other than me can install it" release: a public-repo baseline
