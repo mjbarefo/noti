@@ -86,10 +86,11 @@ DEFAULT_CONFIG = {
         # NOT `git branch` — bare listing is niche and the prefix also covers the
         # mutating `git branch NAME` / `-D` / `-m`. NOT `tree` — its `-o FILE`
         # writes a file and the short flag can't be blocked without also blocking
-        # `grep -o` (see _BASH_DANGEROUS_FLAGS).
+        # `grep -o` (see _BASH_DANGEROUS_FLAGS). NOT `date` — on macOS it sets the
+        # system clock (as root) via a bare-arg form no flag check can catch.
         "bash_safe_commands": [
             "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
-            "git show", "which", "head", "tail", "wc", "date",
+            "git show", "which", "head", "tail", "wc",
             "whoami", "grep",
         ],
         # "exact" (safe: rule matches only this command) | "prefix" (broader)
@@ -453,9 +454,24 @@ def is_safe_bash(command: str, cfg: dict) -> bool:
     cmd = (command or "").strip()
     if not cmd or any(c in _BASH_META for c in cmd):
         return False
-    toks = cmd.split()
+    # Tokenize the way the SHELL does, not with a naive whitespace split. Quotes
+    # and backslashes are NOT in _BASH_META, so `git log --out"put"=/tmp/x` and
+    # `git log --out\put=x` clear the metachar gate — yet bash reassembles them
+    # into `--output=...` and writes the file. cmd.split() sees one opaque token
+    # that never matches `--output`; shlex.split (POSIX) applies the same quote/
+    # backslash removal bash does — on a string already free of $ ` ; | & < > ( )
+    # { } and newline — so the dangerous-flag check sees the REAL argv. Unbalanced
+    # quotes raise ValueError; fail closed (bash would error on it too — an extra
+    # toast at worst).
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return False
     if any(t == f or t.startswith(f + "=") for t in toks for f in _BASH_DANGEROUS_FLAGS):
         return False
+    # The safe-verb match stays on the raw command: quote-splicing a verb
+    # (`l"s"`) only makes it FAIL to match a safe prefix, which is the strict,
+    # safe direction (an extra toast, never a spurious allow).
     return any(cmd == s or cmd.startswith(s + " ") for s in cfg["approval"]["bash_safe_commands"])
 
 

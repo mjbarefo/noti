@@ -13,7 +13,7 @@
     "govern_mcp": true,
     "bash_safe_commands": [
       "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
-      "git show", "which", "head", "tail", "wc", "date",
+      "git show", "which", "head", "tail", "wc",
       "whoami", "grep"
     ],
     "bash_always_mode": "exact",

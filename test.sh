@@ -101,6 +101,18 @@ want("grep -o not over-blocked",         m.is_safe_bash("grep -o foo bar", cfg))
 want("git branch NAME not safe",     not m.is_safe_bash("git branch evil", cfg))
 want("git branch -D not safe",       not m.is_safe_bash("git branch -D main", cfg))
 want("tree -o not safe",             not m.is_safe_bash("tree -o /tmp/x", cfg))
+want("date dropped (macOS clock set)", not m.is_safe_bash("date 010112002020", cfg))
+
+# v0.4 F12 (CRITICAL): the dangerous-flag check tokenizes like the SHELL, so a
+# blocked flag can't be spliced across a quote or backslash. cmd.split() saw one
+# opaque token that missed `--output`; bash reassembles it into a real file write.
+want("quote-spliced --output not safe",     not m.is_safe_bash('git log --out"put"=/tmp/x', cfg))
+want("backslash-spliced --output not safe", not m.is_safe_bash("git log --out\\put=/tmp/x", cfg))
+want("quote-spliced --ext-diff not safe",   not m.is_safe_bash('git diff --ext-di""ff', cfg))
+want("splice + attacker content not safe",  not m.is_safe_bash('git log --pretty=format:"x" --out\\put=/tmp/x', cfg))
+# ...and shell-accurate tokenization must NOT falsely block legitimate quoting
+want("quoted grep arg still safe",              m.is_safe_bash('grep --include="*.py" foo bar', cfg))
+want("unbalanced quotes fail closed",       not m.is_safe_bash('grep "unterminated', cfg))
 
 # F2: an exact Bash 'Always' rule must NOT glob-broaden
 want("exact rule matches itself",      m.pattern_matches("Bash", {"command":"rm -rf node_modules/*"}, "Bash(rm -rf node_modules/*)"))
