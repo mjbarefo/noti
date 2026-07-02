@@ -34,15 +34,16 @@ jobs:
       - name: Policy tests
         run: ./test.sh
 
-      # Best-effort GUI smoke: render one ask + one summary card to PNG. A hosted
-      # runner may have no window server (targetScreen() would then fail), so this
-      # is allowed to fail without failing the build. Promote to a required step
-      # once we confirm runners can render, or drop it.
-      - name: Toast render smoke (best-effort)
-        continue-on-error: true
+      # GUI smoke: render one ask + one summary card to PNG via NOTI_SNAPSHOT and
+      # assert the files exist. Hosted macOS runners have a window server, so this
+      # is enforced (confirmed rendering on first CI run) — it catches a toast
+      # binary that builds but can't actually draw. If a future runner image drops
+      # the window server, re-add `continue-on-error: true`.
+      - name: Toast render smoke
         run: |
           NOTI_SNAPSHOT="$RUNNER_TEMP/ask.png" NOTI_KIND=run \
             ./bin/noti-toast ask "Run command" "git status" Yes Always No
           NOTI_SNAPSHOT="$RUNNER_TEMP/summary.png" \
             ./bin/noti-toast summary "noti" $'it works\nran 3 commands'
+          test -s "$RUNNER_TEMP/ask.png" && test -s "$RUNNER_TEMP/summary.png"
           ls -la "$RUNNER_TEMP"/ask.png "$RUNNER_TEMP"/summary.png
