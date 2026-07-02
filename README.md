@@ -1,5 +1,7 @@
 # noti
 
+[![CI](https://github.com/mjbarefo/noti/actions/workflows/ci.yml/badge.svg)](https://github.com/mjbarefo/noti/actions/workflows/ci.yml)
+
 A tiny toast for Claude Code. Instead of a full-screen agent dashboard, `noti`
 surfaces only the moments a human is actually needed:
 

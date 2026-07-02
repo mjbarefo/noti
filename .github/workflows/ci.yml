@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Apple Silicon runner — the only non-Intel coverage noti gets, so it proves
+    # the arm64 slice compiles and the policy suite passes off the maintainer's
+    # Intel box.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ruff is a CI-only tool, not a runtime dep — pinned to match local. pipx
+      # is preinstalled on hosted macOS runners, so no install step or Homebrew.
+      - name: Lint (ruff)
+        run: pipx run ruff==0.15.20 check noti
+
+      - name: Build universal toast binary
+        run: ./noti build
+
+      - name: Show binary architectures
+        run: lipo -archs bin/noti-toast
+
+      # The real suite is fully headless — it only runs `./noti decide`, never
+      # launches the GUI binary.
+      - name: Policy tests
+        run: ./test.sh
+
+      # Best-effort GUI smoke: render one ask + one summary card to PNG. A hosted
+      # runner may have no window server (targetScreen() would then fail), so this
+      # is allowed to fail without failing the build. Promote to a required step
+      # once we confirm runners can render, or drop it.
+      - name: Toast render smoke (best-effort)
+        continue-on-error: true
+        run: |
+          NOTI_SNAPSHOT="$RUNNER_TEMP/ask.png" NOTI_KIND=run \
+            ./bin/noti-toast ask "Run command" "git status" Yes Always No
+          NOTI_SNAPSHOT="$RUNNER_TEMP/summary.png" \
+            ./bin/noti-toast summary "noti" $'it works\nran 3 commands'
+          ls -la "$RUNNER_TEMP"/ask.png "$RUNNER_TEMP"/summary.png
