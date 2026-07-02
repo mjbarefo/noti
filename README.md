@@ -171,6 +171,13 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   without a shell metacharacter, which is already blocked — but it's a deliberate
   design choice: if you'd rather be asked before secrets are read, drop `cat` /
   `grep` from `bash_safe_commands`.
+- The safe-listed `git` verbs (`git status`, `git log`, `git diff`, `git show`)
+  assume a **trusted `~/.gitconfig`**: a git *alias* (`[alias] log = !cmd`) or
+  `diff.external` runs arbitrary code, so if an attacker can already write your
+  gitconfig, a "safe" `git log` becomes code execution. noti doesn't (and can't,
+  from a permission hook) neutralize aliases; this is the same trust Claude Code
+  itself places in your git config. Drop the `git` entries from
+  `bash_safe_commands` if you don't trust it.
 - MCP auto-allow is **opt-in**: by default every governed MCP call prompts. Add a
   server to `mcp_autoallow_servers` to silence its read-only calls; mutating method
   names still prompt.

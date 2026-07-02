@@ -32,16 +32,25 @@ that diagnoses a stranger's most likely install problems.
 ### Security
 - Closed write/exec holes in the Bash auto-allow safe-list: `git log/diff/show
   --output=FILE` (arbitrary file write) and `--ext-diff` (external diff driver)
-  are now refused, and the mutating-capable `git branch` and `tree` were dropped
-  from the safe-list.
+  are now refused, and the mutating-capable `git branch`, `tree`, and `date`
+  (macOS clock-set) were dropped from the safe-list.
+- The safe-list's dangerous-flag check now tokenizes with `shlex` (shell-accurate
+  word splitting), closing a bypass where a blocked flag was spliced across a
+  quote or backslash (`git log --out"put"=FILE`) to evade the check while bash
+  reassembled it into a real file write.
 - Deny-rule matching is now directional-broad: a bare trailing `*` in a Bash rule
   is treated as a prefix for **deny** (so a deny can no longer be under-matched
   and bypassed by the auto-allow), while **allow** matching stays strict.
+- Path-anchored allow rules only auto-allow when the payload provides `cwd`, so a
+  rule anchored to a guessed directory can't out-vote a deny rule; `cmd_install`
+  now takes the same settings-file lock as rule-writing.
 
 ### Changed
 - `evaluate()` is now total against malformed / forward-incompatible hook
-  payloads (non-dict `tool_input`, non-string `tool_name`, missing fields):
-  every odd shape degrades to a defer or a safe prompt instead of raising.
+  payloads — a non-dict `tool_input`, a non-string `tool_name`, a non-string
+  nested field (`command`, `file_path`, `url`), or missing keys: every odd shape
+  degrades to a defer or a safe prompt instead of raising, so `noti decide` and
+  any caller stay robust.
 
 ### Documentation
 - Honest install story ("the clone is the install — keep it; `git pull &&
