@@ -23,12 +23,17 @@ permission engine underneath.
 
 ## Security (please upgrade)
 
-Two holes in the auto-allow surface are closed in this release:
+Several holes in the auto-allow surface are closed in this release:
 
-- `git log/diff/show --output=FILE` (an arbitrary file write) and `--ext-diff`
-  (an external diff driver) were silently auto-allowed by the Bash safe-list.
-  They now require approval, and the mutating-capable `git branch` and `tree`
-  were removed from the safe-list entirely.
+- **Shell-splice bypass (arbitrary file write).** The safe-list blocked
+  write/exec flags over a naive token split, but quotes and backslashes aren't
+  metacharacters — so `git log --out"put"=FILE` cleared the check while bash
+  reassembled it into `--output=FILE` and wrote attacker-controlled content to
+  any path. The check now tokenizes with `shlex` (shell-accurate), so it sees the
+  real argument vector.
+- `git log/diff/show --output=FILE` and `--ext-diff` (an external diff driver)
+  are no longer auto-allowed, and the mutating-capable `git branch`, `tree`, and
+  `date` (macOS clock-set) were removed from the safe-list.
 - A `deny` rule with a bare trailing `*` (e.g. `Bash(ls*)`) could be **silently
   bypassed**: noti under-matched the deny, auto-allowed via the safe-list, and a
   PreToolUse allow overrode Claude's own deny enforcement. Deny matching is now

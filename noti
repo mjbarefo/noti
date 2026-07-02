@@ -580,11 +580,10 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     tool = tool if isinstance(tool, str) else ""
     tinput = payload.get("tool_input")
     tinput = tinput if isinstance(tinput, dict) else {}
-    # The known scalar sub-fields feed .strip()/.startswith()/urlparse downstream
-    # (is_safe_bash, pattern_matches, make_rule). A non-string one — e.g. a
-    # forward-incompatible build sending `command` as a number — would traceback,
-    # so normalize them here (copy, don't mutate the caller's dict). `questions`
-    # and other structured fields are left as-is; their renderers already guard.
+    # Known scalar sub-fields (command/file_path/notebook_path/url) feed
+    # .strip()/urlparse downstream — normalize a non-string one to "" (copy, don't
+    # mutate the caller's dict). Structured fields like `questions` are left alone;
+    # their renderers already guard non-dict shapes.
     if any(not isinstance(tinput.get(k), (str, type(None))) for k in _TINPUT_STR_FIELDS):
         tinput = {k: ("" if k in _TINPUT_STR_FIELDS and not isinstance(v, str) else v)
                   for k, v in tinput.items()}
