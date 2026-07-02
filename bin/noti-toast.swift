@@ -11,17 +11,27 @@
 //   noti-toast summary "Title" "Body text\nsecond line"
 //       Shows a non-blocking card that auto-dismisses after NOTI_TIMEOUT
 //       seconds (default 6) and exits 0. Click anywhere to dismiss early.
+//       Hovering holds the card open (you're reading it); leaving relights
+//       a short fuse.
 //
 // Optional environment:
 //   NOTI_TIMEOUT  seconds (ask: hard cap before exit 124; summary: dismiss delay)
 //   NOTI_SLOT     integer stack index — offsets the toast so concurrent toasts
 //                 don't overlap (slot 0 is the corner, 1 sits below it, ...)
+//   NOTI_SLOT_DIR directory of slot files (one per live toast). When set, the
+//                 toast publishes its height there, heartbeats it, and re-packs
+//                 the column each 0.4s — stacking below the REAL cards and
+//                 sliding up when a neighbour dismisses.
 //   NOTI_CORNER   top-right (default) | bottom-right | top-left | bottom-left
 //   NOTI_HOTKEYS  "0" disables hover-armed keyboard shortcuts (default on)
-//   NOTI_KIND     run | edit | fetch | mcp | note — colors the semantic dot and
-//                 sets the message in monospace (terminal text is the material)
+//   NOTI_KIND     run | edit | fetch | mcp | note | question | plan — tints
+//                 the icon chip and picks its glyph; run/edit/fetch/mcp set
+//                 the message in monospace (terminal text is the material),
+//                 question/plan stay prose
 //   NOTI_PROJECT  eyebrow line above the title (which session is asking)
 //   NOTI_FOOTER   small monospaced footer line (summary: the tool tally)
+//   NOTI_APPEARANCE  light | dark — force a palette (snapshot/design review
+//                 aid; live toasts follow the system)
 //
 // Design notes (these are deliberate):
 //   * .accessory activation policy  -> no Dock icon, no menu bar.
@@ -30,8 +40,17 @@
 //     switching Spaces. Clicks still register on a non-activating panel.
 //   * The panel is placed on the screen that currently contains the mouse, so it
 //     shows up where you're looking on multi-monitor setups.
+//   * The card follows macOS notification-banner anatomy — icon chip at the
+//     leading edge, text block beside it, ~16pt continuous corners — so it
+//     reads as a system surface, not a foreign dialog. The chip's tint is the
+//     risk class; its glyph is the tool. Claude's terracotta is reserved for
+//     identity moments (primary action, countdown, armed border, run/summary
+//     chips): a glance says "Claude wants me", not "some app wants me".
 //   * Cards are sized to their content — a one-line `ls` gets a compact card,
-//     a long command gets room (capped at 5 lines).
+//     a long command gets room (capped at 5 lines). Text is measured with the
+//     same NSTextField cell that renders it, and a clipped command always shows
+//     a trailing ellipsis — approving a command you can only see part of, and
+//     don't know is partial, is how mistakes happen.
 //   * The ask card's bottom hairline drains over NOTI_TIMEOUT: when it empties,
 //     the prompt falls back to the terminal. The deadline is never a surprise.
 //   * Hotkeys are HOVER-ARMED: the panel only grabs the keyboard after the mouse
@@ -55,6 +74,12 @@ guard let mode = args.first else {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)            // no Dock icon, no menu bar
 
+// Snapshot/design aid: force a palette so both light and dark can be reviewed
+// headlessly. Must happen before any view resolves a color.
+if let forced = env["NOTI_APPEARANCE"] {
+    app.appearance = NSAppearance(named: forced == "light" ? .aqua : .darkAqua)
+}
+
 // ----------------------------------------------------------------------------
 // Geometry + text helpers
 // ----------------------------------------------------------------------------
@@ -65,11 +90,43 @@ func targetScreen() -> NSScreen {
     return NSScreen.main ?? NSScreen.screens.first ?? NSScreen.screens[0]
 }
 
-func toastOrigin(width: CGFloat, height: CGFloat) -> NSPoint {
-    let vf = targetScreen().visibleFrame
-    let margin: CGFloat = 16, gap: CGFloat = 10
-    let slot = CGFloat(Int(env["NOTI_SLOT"] ?? "0") ?? 0)
-    let stack = slot * (height + gap)
+// ----------------------------------------------------------------------------
+// Slot stacking — concurrent toasts form one packed, self-healing column.
+//
+// Each slotted toast publishes its own pixel height into its slot file (the
+// Python side creates the file EMPTY; only the binary ever writes a number)
+// and heartbeats it every 0.4s so a killed toast goes stale fast. A toast's
+// vertical offset is the sum of the LIVE heights below it — not
+// slot-index × its own height, which overlaps a taller card and floats past a
+// shorter one — and every tick it re-packs, sliding up smoothly when a
+// neighbour dismisses.
+// ----------------------------------------------------------------------------
+
+let slotIndex = max(0, Int(env["NOTI_SLOT"] ?? "0") ?? 0)
+let slotDir = env["NOTI_SLOT_DIR"]
+let slotGap: CGFloat = 10
+var slotFile: String?          // global: read by the capture-less atexit handler
+
+func stackOffset(myHeight: CGFloat) -> CGFloat {
+    guard let dir = slotDir else {
+        return CGFloat(slotIndex) * (myHeight + slotGap)   // bare CLI use: no registry
+    }
+    var off: CGFloat = 0
+    for j in 0..<slotIndex {
+        let p = "\(dir)/slot-\(j)"
+        guard FileManager.default.fileExists(atPath: p) else { continue }
+        // an empty file is "claimed, height not yet published" — assume a card
+        // like mine; the clamp keeps garbage from stacking the toast off-screen
+        let h = (try? String(contentsOfFile: p, encoding: .utf8))
+            .flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .flatMap { (40...800).contains($0) ? CGFloat($0) : nil }
+        off += (h ?? myHeight) + slotGap
+    }
+    return off
+}
+
+func origin(in vf: NSRect, width: CGFloat, height: CGFloat, stack: CGFloat) -> NSPoint {
+    let margin: CGFloat = 16
     switch env["NOTI_CORNER"] ?? "top-right" {
     case "top-left":     return NSPoint(x: vf.minX + margin,          y: vf.maxY - height - margin - stack)
     case "bottom-left":  return NSPoint(x: vf.minX + margin,          y: vf.minY + margin + stack)
@@ -82,25 +139,71 @@ func lineHeight(_ font: NSFont) -> CGFloat {
     ceil(NSLayoutManager().defaultLineHeight(for: font))
 }
 
-func textHeight(_ s: String, font: NSFont, width: CGFloat, maxLines: Int) -> CGFloat {
-    let rect = (s as NSString).boundingRect(
-        with: NSSize(width: width, height: .greatestFiniteMagnitude),
-        options: [.usesLineFragmentOrigin, .usesFontLeading],
-        attributes: [.font: font])
-    return min(ceil(rect.height), CGFloat(maxLines) * lineHeight(font))
+// Wrapped text is measured with a real NSTextFieldCell — the exact machinery
+// that renders it. boundingRect() wraps slightly differently around quotes and
+// backslashes, and a height that disagrees with layout means a command clipped
+// with no visible ellipsis: the user approves text they can't see. Returns the
+// height *and* the line count that fits, so the label's maximumNumberOfLines
+// can be set to what actually renders (that's what makes the "…" appear).
+func measure(_ s: String, font: NSFont, width: CGFloat, maxLines: Int) -> (height: CGFloat, lines: Int) {
+    let t = NSTextField(labelWithString: s)
+    t.font = font
+    t.lineBreakMode = .byWordWrapping
+    t.cell?.wraps = true
+    t.maximumNumberOfLines = 0
+    // per-line height must come from the cell too: NSLayoutManager says 13pt
+    // where the cell renders 14pt lines, and a frame built on the smaller
+    // number silently loses its last line ("Mg" probe = one cell line, immune
+    // to embedded newlines in the measured string)
+    let probe = NSTextField(labelWithString: "Mg")
+    probe.font = font
+    let lh = probe.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: 10_000, height: 10_000)).height
+             ?? lineHeight(font)
+    let full = t.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width, height: 100_000)).height ?? lh
+    let lines = max(1, min(maxLines, Int((full / lh).rounded())))
+    return (CGFloat(lines) * lh, lines)
 }
 
-// Semantic dot: the action's risk class, readable before a single word.
-func dotColor(_ kind: String) -> NSColor {
+// Claude's terracotta — the identity accent. Lifted a touch in dark mode so it
+// keeps its warmth against the dark material instead of going muddy.
+let claude = NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        ? NSColor(srgbRed: 0.898, green: 0.545, blue: 0.427, alpha: 1)   // ≈ #E58B6D
+        : NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1)   // ≈ #D97757
+}
+
+// Semantic chip: tint is the action's risk class, readable before a single
+// word. run and note wear Claude's terracotta — the everyday ask and the
+// end-of-turn card are where "that's Claude" has to land from across the room.
+func kindColor(_ kind: String) -> NSColor {
     switch kind {
-    case "run":   return .systemOrange
-    case "edit":  return .systemBlue
-    case "fetch": return .systemPurple
-    case "mcp":   return .systemTeal
-    case "note":  return .systemGreen
-    default:      return .tertiaryLabelColor
+    case "run":      return claude
+    case "edit":     return .systemBlue
+    case "fetch":    return .systemPurple
+    case "mcp":      return .systemTeal
+    case "note":     return claude
+    case "question": return .systemIndigo
+    case "plan":     return .systemGreen
+    default:         return .systemGray
     }
 }
+
+func kindGlyph(_ kind: String) -> String {
+    switch kind {
+    case "run":      return "terminal.fill"
+    case "edit":     return "pencil"
+    case "fetch":    return "globe"
+    case "mcp":      return "puzzlepiece.extension.fill"
+    case "note":     return "sparkles"
+    case "question": return "questionmark.bubble.fill"
+    case "plan":     return "checklist"
+    default:         return "questionmark"
+    }
+}
+
+// Terminal-material kinds show their payload in monospace at full contrast —
+// the command IS the content. Questions and plan previews are prose.
+let monoKinds: Set<String> = ["run", "edit", "fetch", "mcp", "tool"]
 
 let hairline = NSColor.separatorColor
 
@@ -147,14 +250,42 @@ func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
     vev.state = .active
     vev.blendingMode = .behindWindow
     vev.wantsLayer = true
-    vev.layer?.cornerRadius = 12
+    vev.layer?.cornerRadius = 16                  // current banner geometry (Sonoma/Sequoia scale)
     vev.layer?.cornerCurve = .continuous          // Apple's squircle, not a pure round
     vev.layer?.masksToBounds = true
     vev.layer?.borderWidth = 1
     vev.layer?.borderColor = hairline.cgColor     // definition against busy backdrops
     panel.contentView = vev
 
-    panel.setFrameOrigin(toastOrigin(width: width, height: height))
+    // screen resolved ONCE — the reflow tick below must re-pack the column,
+    // not chase the mouse to another monitor mid-display
+    let vf = targetScreen().visibleFrame
+    panel.setFrameOrigin(origin(in: vf, width: width, height: height,
+                                stack: stackOffset(myHeight: height)))
+
+    if let dir = slotDir {
+        let mine = "\(dir)/slot-\(slotIndex)"
+        try? "\(Int(height))".write(toFile: mine, atomically: true, encoding: .utf8)
+        slotFile = mine
+        atexit { if let p = slotFile { try? FileManager.default.removeItem(atPath: p) } }
+        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
+            // heartbeat: mtime is the liveness signal for the Python stale sweep
+            try? "\(Int(height))".write(toFile: mine, atomically: true, encoding: .utf8)
+            guard slotIndex > 0 else { return }            // the corner card never moves
+            let target = origin(in: vf, width: width, height: height,
+                                stack: stackOffset(myHeight: height))
+            guard abs(target.y - panel.frame.origin.y) > 0.5 else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                panel.setFrameOrigin(target)
+            } else {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.25
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().setFrameOrigin(target)
+                }
+            }
+        }
+    }
     return (panel, vev)
 }
 
@@ -163,18 +294,39 @@ func label(_ s: String, font: NSFont, color: NSColor, frame: NSRect, maxLines: I
     t.frame = frame
     t.font = font
     t.textColor = color
-    t.lineBreakMode = .byTruncatingTail
     t.maximumNumberOfLines = maxLines
-    t.cell?.wraps = maxLines > 1
+    if maxLines > 1 {
+        // wrap + truncatesLastVisibleLine is the combo that renders a real "…"
+        // on the last fitting line; .byTruncatingTail alone wraps but clips
+        // silently when fewer lines fit than maximumNumberOfLines
+        t.lineBreakMode = .byWordWrapping
+        t.cell?.wraps = true
+        t.cell?.truncatesLastVisibleLine = true
+    } else {
+        t.lineBreakMode = .byTruncatingTail
+    }
     t.cell?.isScrollable = false
     return t
 }
 
-func dotView(x: CGFloat, y: CGFloat, kind: String) -> NSView {
-    let v = NSView(frame: NSRect(x: x, y: y, width: 7, height: 7))
+// The icon chip — a notification banner leads with the app icon; this card
+// leads with the kind. Continuous-corner tinted square, white SF Symbol glyph.
+func chipView(x: CGFloat, y: CGFloat, size: CGFloat, kind: String) -> NSView {
+    let v = NSView(frame: NSRect(x: x, y: y, width: size, height: size))
     v.wantsLayer = true
-    v.layer?.backgroundColor = dotColor(kind).cgColor
-    v.layer?.cornerRadius = 3.5
+    v.layer?.backgroundColor = kindColor(kind).cgColor
+    v.layer?.cornerRadius = size * 0.3
+    v.layer?.cornerCurve = .continuous
+    let cfg = NSImage.SymbolConfiguration(pointSize: size * 0.5, weight: .semibold)
+    if let img = (NSImage(systemSymbolName: kindGlyph(kind), accessibilityDescription: kind)
+                  ?? NSImage(systemSymbolName: "circle.fill", accessibilityDescription: kind))?
+        .withSymbolConfiguration(cfg) {
+        let iv = NSImageView(image: img)
+        iv.contentTintColor = .white
+        iv.imageScaling = .scaleNone
+        iv.frame = v.bounds
+        v.addSubview(iv)
+    }
     return v
 }
 
@@ -237,8 +389,10 @@ final class Handler: NSObject {
 // ----------------------------------------------------------------------------
 // ToastButton — flat, self-documenting button with its hotkey as a keycap chip.
 // Stock NSButton bezels read as a generic system dialog; these are quiet,
-// continuous-corner fills where the primary action carries the accent and the
-// keycap answers "how do I press this" without a legend.
+// continuous-corner fills where the primary action carries Claude's terracotta
+// (not the user's system accent — the answer button should look like it belongs
+// to Claude, not to a random dialog) and the keycap answers "how do I press
+// this" without a legend.
 // ----------------------------------------------------------------------------
 
 final class ToastButton: NSControl {
@@ -246,9 +400,9 @@ final class ToastButton: NSControl {
     let key: String                    // hotkey character ("" = none shown)
     private let primary: Bool
     private var capBox: NSView?
-    private var fill: NSColor { primary ? .controlAccentColor
+    private var fill: NSColor { primary ? claude
                                         : NSColor.labelColor.withAlphaComponent(0.08) }
-    private var hoverFill: NSColor { primary ? NSColor.controlAccentColor.withAlphaComponent(0.85)
+    private var hoverFill: NSColor { primary ? claude.withAlphaComponent(0.85)
                                              : NSColor.labelColor.withAlphaComponent(0.14) }
 
     static let titleFont = NSFont.systemFont(ofSize: 12, weight: .medium)
@@ -273,6 +427,8 @@ final class ToastButton: NSControl {
         layer?.cornerRadius = 7
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = fill.cgColor
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
 
         let titleColor: NSColor = primary ? .white : .labelColor
         let t = NSTextField(labelWithString: title)
@@ -361,39 +517,47 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     let btnRowW = btnWidths.reduce(0, +) + CGFloat(max(0, buttons.count - 1)) * 8
 
     let pad: CGFloat = 16
+    let chip: CGFloat = 26                     // banner anatomy: icon chip leads
     let W: CGFloat = min(560, max(360, btnRowW + 2 * pad))
     let textW = W - 2 * pad
+    let headX = pad + chip + 10                // text block sits beside the chip
+    let headW = W - headX - pad
     let eyebrowFont = NSFont.systemFont(ofSize: 11, weight: .medium)
     let titleFont   = NSFont.systemFont(ofSize: 13, weight: .semibold)
-    // the command IS the content — terminal material, full label color
-    let msgFont: NSFont = kind.isEmpty ? .systemFont(ofSize: 12)
-                                       : .monospacedSystemFont(ofSize: 11.5, weight: .regular)
-    let msgColor: NSColor = kind.isEmpty ? .secondaryLabelColor : .labelColor
+    let mono = monoKinds.contains(kind)
+    let msgFont: NSFont = mono ? .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+                               : .systemFont(ofSize: 12)
+    let msgColor: NSColor = mono ? .labelColor : .secondaryLabelColor
 
     let eyeH: CGFloat = project.isEmpty ? 0 : lineHeight(eyebrowFont)
     let titleH = lineHeight(titleFont)
-    let msgH: CGFloat = message.isEmpty ? 0 : textHeight(message, font: msgFont, width: textW, maxLines: 5)
+    let headerH = max(chip, eyeH + (eyeH > 0 ? 3 : 0) + titleH)
+    let (msgH, msgLines): (CGFloat, Int) =
+        message.isEmpty ? (0, 0) : measure(message, font: msgFont, width: textW, maxLines: 5)
 
-    var H: CGFloat = 14 + titleH + 12 + ToastButton.height + 14 // padding + title + buttons row
-    if eyeH > 0 { H += eyeH + 5 }
-    if msgH > 0 { H += 6 + msgH }
+    var H: CGFloat = 14 + headerH + 12 + ToastButton.height + 14
+    if msgH > 0 { H += 9 + msgH }
 
     let (panel, vev) = makeCard(width: W, height: H)
-    var y = H - 14
+    let headerBottom = H - 14 - headerH
+    vev.addSubview(chipView(x: pad, y: headerBottom + (headerH - chip) / 2, size: chip, kind: kind))
     if eyeH > 0 {
-        y -= eyeH
-        vev.addSubview(dotView(x: pad, y: y + (eyeH - 7) / 2, kind: kind))
         vev.addSubview(label(project, font: eyebrowFont, color: .secondaryLabelColor,
-                             frame: NSRect(x: pad + 13, y: y, width: textW - 13, height: eyeH)))
-        y -= 5
+                             frame: NSRect(x: headX, y: headerBottom + headerH - eyeH,
+                                           width: headW, height: eyeH)))
+        vev.addSubview(label(title, font: titleFont, color: .labelColor,
+                             frame: NSRect(x: headX, y: headerBottom, width: headW, height: titleH)))
+    } else {
+        vev.addSubview(label(title, font: titleFont, color: .labelColor,
+                             frame: NSRect(x: headX, y: headerBottom + (headerH - titleH) / 2,
+                                           width: headW, height: titleH)))
     }
-    y -= titleH
-    vev.addSubview(label(title, font: titleFont, color: .labelColor,
-                         frame: NSRect(x: pad, y: y, width: textW, height: titleH)))
     if msgH > 0 {
-        y -= 6 + msgH
+        // full width below the header — command real estate beats strict
+        // banner indentation; five mono lines at 11.5pt need every point
         vev.addSubview(label(message, font: msgFont, color: msgColor,
-                             frame: NSRect(x: pad, y: y, width: textW, height: msgH), maxLines: 5))
+                             frame: NSRect(x: pad, y: headerBottom - 9 - msgH,
+                                           width: textW, height: msgH), maxLines: msgLines))
     }
 
     let handler = Handler()
@@ -416,7 +580,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             armed = true
             panel.makeKey()
             // arming must be visible — the user needs to know the keyboard is live
-            vev.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
+            vev.layer?.borderColor = claude.withAlphaComponent(0.9).cgColor
             buttonViews.forEach { $0.setArmed(true) }
         }
         vev.onLeave = {
@@ -454,7 +618,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         let drain = CALayer()
         drain.anchorPoint = CGPoint(x: 0, y: 0)
         drain.frame = CGRect(x: 0, y: 0, width: W, height: 2)
-        drain.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.35).cgColor
+        drain.backgroundColor = claude.withAlphaComponent(0.5).cgColor
         vev.layer?.addSublayer(drain)
         let a = CABasicAnimation(keyPath: "bounds.size.width")
         a.fromValue = W
@@ -477,27 +641,33 @@ case "summary":   // noti-toast summary "Title" "Body\nlines"
     let footer = env["NOTI_FOOTER"] ?? ""
 
     let W: CGFloat = 360, pad: CGFloat = 16, textW = W - 2 * pad
-    let titleFont  = NSFont.systemFont(ofSize: 12, weight: .semibold)
+    let chip: CGFloat = 20
+    let titleFont  = NSFont.systemFont(ofSize: 13, weight: .semibold)
     let bodyFont   = NSFont.systemFont(ofSize: 12)
     let footerFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
 
-    let titleH  = lineHeight(titleFont)
-    let bodyH: CGFloat   = body.isEmpty ? 0 : textHeight(body, font: bodyFont, width: textW, maxLines: 3)
+    let titleH = lineHeight(titleFont)
+    let rowH   = max(chip, titleH)
+    let (bodyH, bodyLines): (CGFloat, Int) =
+        body.isEmpty ? (0, 0) : measure(body, font: bodyFont, width: textW, maxLines: 3)
     let footerH: CGFloat = footer.isEmpty ? 0 : lineHeight(footerFont)
 
-    var H: CGFloat = 12 + titleH + 12
-    if bodyH > 0 { H += 4 + bodyH }
+    var H: CGFloat = 12 + rowH + 12
+    if bodyH > 0 { H += 6 + bodyH }
     if footerH > 0 { H += 6 + footerH }
 
     let (panel, vev) = makeCard(width: W, height: H)
-    var y = H - 12 - titleH
-    vev.addSubview(dotView(x: pad, y: y + (titleH - 7) / 2, kind: kind))
+    let rowBottom = H - 12 - rowH
+    vev.addSubview(chipView(x: pad, y: rowBottom + (rowH - chip) / 2, size: chip, kind: kind))
     vev.addSubview(label(title, font: titleFont, color: .labelColor,
-                         frame: NSRect(x: pad + 13, y: y, width: textW - 13, height: titleH)))
+                         frame: NSRect(x: pad + chip + 9, y: rowBottom + (rowH - titleH) / 2,
+                                       width: textW - chip - 9, height: titleH)))
+    var y = rowBottom
     if bodyH > 0 {
-        y -= 4 + bodyH
+        y -= 6 + bodyH
         vev.addSubview(label(body, font: bodyFont, color: .secondaryLabelColor,
-                             frame: NSRect(x: pad, y: y, width: textW, height: bodyH), maxLines: 3))
+                             frame: NSRect(x: pad, y: y, width: textW, height: bodyH),
+                             maxLines: bodyLines))
     }
     if footerH > 0 {
         y -= 6 + footerH
@@ -509,13 +679,25 @@ case "summary":   // noti-toast summary "Title" "Body\nlines"
     vev.addGestureRecognizer(NSClickGestureRecognizer(target: handler,
                                                       action: #selector(Handler.dismiss(_:))))
 
-    let secs = timeoutSeconds(default: 6)
-    Timer.scheduledTimer(withTimeInterval: max(0.3, secs - 0.3), repeats: false) { _ in
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.3
-            panel.animator().alphaValue = 0
-        }, completionHandler: { exit(0) })
+    // Native-banner behavior: the card holds while you're reading it (hover)
+    // and relights a short fuse when you leave. Arming is movement-gated by
+    // HoverEffectView, so a toast surfacing under a parked cursor still
+    // dismisses on schedule — only deliberate attention pins it.
+    var fuse: Timer?
+    func scheduleDismiss(after t: TimeInterval) {
+        fuse?.invalidate()
+        fuse = Timer.scheduledTimer(withTimeInterval: t, repeats: false) { _ in
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.3
+                panel.animator().alphaValue = 0
+            }, completionHandler: { exit(0) })
+        }
     }
+    let secs = timeoutSeconds(default: 6)
+    scheduleDismiss(after: max(0.3, secs - 0.3))
+    vev.onArm = { fuse?.invalidate(); fuse = nil }
+    vev.onLeave = { scheduleDismiss(after: 1.2) }
+
     present(panel)
     snapshotIfRequested(vev)
     _ = handler                                    // keep alive

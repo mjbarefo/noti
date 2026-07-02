@@ -1,19 +1,33 @@
 # noti
 
 A tiny toast for Claude Code. Instead of a full-screen agent dashboard, `noti`
-surfaces only the two moments a human is actually needed:
+surfaces only the moments a human is actually needed:
 
 1. **Approval** — when Claude wants to run a command, edit a file, or call a
-   mutating MCP tool, a small borderless toast pops in the corner: a colored
-   dot + project name (which session, what risk class), the action, and the
+   mutating MCP tool, a small borderless toast pops in the corner: a tinted
+   icon chip + project name (which session, what risk class), the action, and the
    command in monospace, with **Yes / Always / No** buttons that each carry
    their hotkey as a keycap. Your answer becomes Claude's permission decision;
    the terminal prompt never appears. Click, or hover the toast and press
    **y / a / n** (Esc = fall back to the terminal prompt). A hairline drains
    along the bottom edge — when it empties, the prompt moves to the terminal.
-2. **Summary** — when a turn ends, a small toast shows a trimmed version of
-   Claude's final message plus what it did (`ran 3 commands · edited 2 files`),
-   then auto-dismisses (or click it to dismiss early).
+2. **Questions & plans** — when Claude asks a multiple-choice question
+   (`AskUserQuestion`), a single simple question becomes a toast whose buttons
+   *are* the options: one click answers it (the hook returns the answer via
+   `updatedInput`, so the terminal picker never appears). Multi-question,
+   multi-select, or 4+-option sets get a non-blocking heads-up toast instead —
+   the terminal UI (option descriptions, free-text "Other") owns those. When a
+   plan is ready (`ExitPlanMode`), the toast shows a preview with
+   **Approve / View**: Approve accepts the plan (implementation still goes
+   through approval toasts); View, Esc, or timeout hands you the full plan UI
+   in the terminal.
+3. **Summary** — when a turn ends, a small toast shows a trimmed version of
+   Claude's final message plus what it did (`ran 3 commands · edited 2 files ·
+   answered 1 question`), then auto-dismisses (hover to hold it, click to
+   dismiss early).
+
+Concurrent toasts (several sessions, an approval plus a summary) stack in one
+packed column and re-pack smoothly as cards dismiss.
 
 No multiplexer, no panes, no persistent server. You keep using whatever terminal
 you already run `claude` in; noti just injects itself at those two points via
@@ -30,6 +44,9 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
                                                                     ├ No ───▶ deny
                                                                     └ (timeout) ▶ ask  (fall back to
                                                                                  Claude's terminal prompt)
+                 AskUserQuestion ─▶ options as buttons ─▶ answer via updatedInput
+                                    (complex sets: heads-up toast, answer in terminal)
+                 ExitPlanMode ────▶ Approve ─▶ allow  ·  View/timeout ─▶ terminal plan UI
 Stop hook ──────▶ trimmed last message + tool tally ─▶ non-blocking summary toast
 ```
 
@@ -68,9 +85,10 @@ choice=$(noti ask --title "Deploy?" --message "ship to prod" --buttons Yes,No)
 noti notify --title "Build" --body "all targets compiled" --footer "12s · 0 warnings"
 ```
 
-Optional styling flags: `--kind run|edit|fetch|mcp|note` (colors the dot and sets
-the message in monospace), `--project NAME` (eyebrow line on ask toasts),
-`--footer TEXT` (small monospaced line on notify toasts).
+Optional styling flags: `--kind run|edit|fetch|mcp|note|question|plan` (tints the
+icon chip; run/edit/fetch/mcp render the message in monospace), `--project NAME`
+(eyebrow line on ask toasts), `--footer TEXT` (small monospaced line on notify
+toasts).
 
 ## Configuration
 
@@ -84,6 +102,8 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `toast.hotkeys` | `true` | hover-armed keyboard shortcuts on the ask toast (see safety notes) |
 | `approval.governed_tools` | Bash, Edit, Write, MultiEdit, NotebookEdit, WebFetch | which tools can toast |
 | `approval.govern_mcp` | `true` | route MCP tool calls through noti |
+| `approval.surface_questions` | `true` | toast `AskUserQuestion` (simple ones answerable from the toast) |
+| `approval.surface_plans` | `true` | toast `ExitPlanMode` with Approve / View |
 | `approval.mcp_autoallow_servers` | `[]` | servers whose read-only calls auto-allow; empty = every MCP call prompts |
 | `approval.bash_safe_commands` | ls, git status, grep, … | auto-allowed read-only verbs (no exec/write/delete flags, no shell metacharacters) |
 | `approval.bash_always_mode` | `exact` | `exact` = "Always" rule matches only this command (safe); `prefix` = broader |
@@ -101,8 +121,15 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 - MCP auto-allow is **opt-in**: by default every governed MCP call prompts. Add a
   server to `mcp_autoallow_servers` to silence its read-only calls; mutating method
   names still prompt.
-- `deny` rules always win — they're checked before every allow path, in every mode.
-  In `dontAsk` mode noti never toasts (you asked not to be asked).
+- `deny` rules always win — they're checked before every allow path, in every mode
+  (including question/plan surfacing). In `dontAsk` mode noti never shows a
+  *permission* toast (you asked not to be asked) — questions and plans still
+  surface, because the session blocks on them regardless of permission mode.
+- Answering a question from the toast uses the PreToolUse `updatedInput` channel
+  with the **exact** question/option strings. A Claude Code too old to support
+  it simply ignores the field and asks in the terminal — degraded, never a
+  wrong answer. Anything the toast can't represent faithfully (multi-select,
+  4+ options, free-text "Other") is never answered from the toast at all.
 - **Hotkeys are hover-armed.** The toast only captures the keyboard after the
   mouse *moves* over it, and releases it the moment the mouse leaves. A toast
   appearing while you type — even directly under a parked cursor — can never

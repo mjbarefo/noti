@@ -36,6 +36,14 @@ check "find -delete NOT allowed"    "$(j Bash '{"command":"find . -delete"}' def
 check "dontAsk mode defers"         "$(j Bash '{"command":"rm -rf build"}' dontAsk)"          defer
 check "auto mode still governs"     "$(j Bash '{"command":"rm -rf build"}' auto)"             prompt
 
+# v0.3: Claude-to-human interaction tools surface in every permission mode
+check "simple question toasts"      "$(j AskUserQuestion '{"questions":[{"question":"Which auth approach?","header":"Auth","options":[{"label":"JWT"},{"label":"Sessions"},{"label":"OAuth"}],"multiSelect":false}]}' default)" question
+check "question surfaces in bypass" "$(j AskUserQuestion '{"questions":[{"question":"Proceed?","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}' bypassPermissions)" question
+check "multiSelect question notifies" "$(j AskUserQuestion '{"questions":[{"question":"Pick features","options":[{"label":"A"},{"label":"B"}],"multiSelect":true}]}' default)" notice
+check "multi-question notifies"     "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"}]}]}' default)" notice
+check "4-option question notifies"  "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"}]}]}' default)" notice
+check "plan review toasts (plan mode)" "$(j ExitPlanMode '{"plan":"# Plan\n1. do the thing"}' plan)" plan
+
 echo
 echo "rule round-trip (an 'Always' rule must match the next identical call)"
 python3 - "$CWD" <<'PY'
@@ -165,6 +173,32 @@ with open(tpath, "w") as f:
     f.write(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"the real last message"}]}}) + "\n")
 want("transcript fallback finds last text", m.last_message_from_transcript(tpath) == "the real last message")
 want("transcript fallback survives ENOENT", m.last_message_from_transcript("/nope/nothing.jsonl") == "")
+
+# v0.3: interaction tools — deny keeps its hard floor; answers must round-trip
+# the EXACT question/option strings (truncated button labels must never leak
+# into updatedInput, or Claude Code won't recognise the answer)
+q = {"questions": [{"question": "Which authentication approach should we take?",
+                    "header": "Auth",
+                    "options": [{"label": "JWT with long refresh tokens"},
+                                {"label": "Server-side sessions"}],
+                    "multiSelect": False}]}
+m.load_patterns = lambda cwd, kind: (["AskUserQuestion"] if kind == "deny" else [])
+try:
+    d3 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q,
+                     "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+    want("deny beats question surface", d3["action"] == "deny")
+finally:
+    m.load_patterns = orig
+d4 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q,
+                 "permission_mode": "dontAsk", "cwd": sys.argv[1]}, cfg)
+want("question surfaces even in dontAsk", d4["action"] == "question")
+want("question keeps exact answer strings",
+     d4.get("question") == q["questions"][0]["question"]
+     and d4.get("options") == ["JWT with long refresh tokens", "Server-side sessions"])
+offcfg = copy.deepcopy(cfg); offcfg["approval"]["surface_plans"] = False
+d5 = m.evaluate({"tool_name": "ExitPlanMode", "tool_input": {"plan": "x"},
+                 "permission_mode": "plan", "cwd": sys.argv[1]}, offcfg)
+want("surface_plans=false defers", d5["action"] == "defer")
 
 sys.exit(1 if bad else 0)
 PY

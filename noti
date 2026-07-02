@@ -64,6 +64,12 @@ DEFAULT_CONFIG = {
         # Tools that trigger a Yes/Always/No toast (read-only tools are never wired up).
         "governed_tools": ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
         "govern_mcp": True,
+        # Claude-to-human interaction tools — not permission gates, but the
+        # session blocks on them in EVERY permission mode, so noti surfaces
+        # them in every mode too. Simple single questions become a toast whose
+        # buttons ARE the options; plans become an Approve/View card.
+        "surface_questions": True,
+        "surface_plans": True,
         # Bash commands that auto-allow silently (only when they contain NO shell
         # metacharacters). Keep this list genuinely read-only.
         # Genuinely read-only verbs only. NOT env/find/rg — those can exec or
@@ -175,8 +181,11 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
     env["NOTI_HOTKEYS"] = "1" if hotkeys else "0"
     if slot is not None:
         env["NOTI_SLOT"] = str(slot)
+        # lets the toast publish its height, heartbeat its claim, and re-pack
+        # the column when a neighbour dismisses
+        env["NOTI_SLOT_DIR"] = str(SLOT_DIR)
     if kind:
-        env["NOTI_KIND"] = kind        # colors the semantic dot; mono message
+        env["NOTI_KIND"] = kind        # tints the icon chip; mono message
     if project:
         env["NOTI_PROJECT"] = project  # eyebrow line: which session is asking
     if footer:
@@ -201,30 +210,44 @@ def toast_summary(title, body, timeout, corner, kind="note", footer=""):
     """Non-blocking. Spawns a detached toast that auto-dismisses, then returns."""
     if not BINARY.exists():
         raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
-    subprocess.Popen(
-        [str(BINARY), "summary", title, body],
-        env=_toast_env(timeout, None, corner, kind=kind, footer=footer),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # summaries join the same slot column as ask toasts, so an end-of-turn
+    # card can never land on top of another session's pending approval. The
+    # detached toast owns the release (it deletes its slot file on exit);
+    # the stale sweep reclaims the slot if it never launches.
+    slot = acquire_slot()
+    try:
+        subprocess.Popen(
+            [str(BINARY), "summary", title, body],
+            env=_toast_env(timeout, slot, corner, kind=kind, footer=footer),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        release_slot(slot)
+        raise
 
 
 def acquire_slot(max_slots: int = 8) -> int:
-    """Claim the lowest free vertical slot so concurrent toasts don't overlap."""
+    """Claim the lowest free vertical slot so concurrent toasts don't overlap.
+
+    The slot file is created EMPTY: the toast binary itself writes its pixel
+    height into it (and heartbeats it), so sibling toasts can stack below the
+    real column of cards rather than guessing every card is their own height.
+    Anything numeric in the file must be a height — never write a pid here."""
     SLOT_DIR.mkdir(parents=True, exist_ok=True)
     for i in range(max_slots):
         p = SLOT_DIR / f"slot-{i}"
         try:
-            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
+            os.close(os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
             return i
         except FileExistsError:
-            # reclaim a stale slot (>30 min old — a toast never lives that long)
+            # reclaim a stale slot (>2 min: live toasts heartbeat their file
+            # every 0.4s, so anything older is a corpse) and claim it
             try:
-                if time.time() - p.stat().st_mtime > 1800:
+                if time.time() - p.stat().st_mtime > 120:
                     p.unlink(missing_ok=True)
-                    continue
+                    os.close(os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                    return i
             except Exception:
                 pass
     return 0  # all busy: overlap rather than fail
@@ -429,8 +452,8 @@ def is_governed(tool: str, cfg: dict) -> bool:
 
 
 def render_call(tool: str, tinput: dict):
-    """-> (kind, title, message). kind drives the toast's semantic dot color
-    and monospace treatment: run | edit | fetch | mcp | tool."""
+    """-> (kind, title, message). kind drives the toast's icon chip (tint +
+    glyph) and monospace treatment: run | edit | fetch | mcp | tool."""
     if tool == "Bash":
         return "run", "Run command", trunc(tinput.get("command", ""), 220)
     if tool in EDIT_TOOLS:
@@ -447,6 +470,47 @@ def render_call(tool: str, tinput: dict):
     return "tool", tool, trunc(json.dumps(tinput, ensure_ascii=False), 200)
 
 
+def render_question(tinput: dict) -> dict:
+    """AskUserQuestion -> decision dict. One single-select question with 2-3
+    options becomes a 'question' toast whose buttons ARE the options — the
+    common case, answered without touching the terminal. Anything richer
+    (several questions, multiSelect, 4+ options — and the terminal UI also
+    owns free-text "Other") becomes a non-blocking 'notice' so the human
+    knows the session is waiting on them."""
+    qs = [q for q in (tinput.get("questions") or []) if isinstance(q, dict)]
+    if len(qs) == 1 and not qs[0].get("multiSelect"):
+        q = qs[0]
+        options = [o.get("label", "") if isinstance(o, dict) else str(o)
+                   for o in (q.get("options") or [])]
+        options = [o for o in options if o]
+        if 2 <= len(options) <= 3:
+            header = str(q.get("header") or "").strip()
+            return {"action": "question",
+                    "title": f"Claude asks — {header}" if header else "Claude asks",
+                    "message": trunc(str(q.get("question") or ""), 220),
+                    # full texts, not the truncated button labels: `answers`
+                    # must be keyed by the exact question, valued by the exact
+                    # option label, or Claude Code won't recognise the answer
+                    "question": str(q.get("question") or ""),
+                    "options": options,
+                    "buttons": [trunc(o, 16) for o in options]}
+    n = len(qs)
+    first = trunc(str(qs[0].get("question") or ""), 160) if qs else ""
+    return {"action": "notice", "kind": "question",
+            "title": "Claude has a question" if n <= 1 else f"Claude has {n} questions",
+            "message": first + (f"  (+{n - 1} more)" if n > 1 else ""),
+            "footer": "answer in the terminal"}
+
+
+def render_plan(tinput: dict) -> dict:
+    """ExitPlanMode -> decision dict. The toast is a fast-path Approve plus a
+    deliberate View that hands off to the terminal's full plan UI — a corner
+    card must never pretend to show a whole plan."""
+    preview = clean_summary(str(tinput.get("plan") or ""), 220)
+    return {"action": "plan", "title": "Plan ready for review",
+            "message": preview or "Review the plan in the terminal."}
+
+
 def evaluate(payload: dict, cfg: dict) -> dict:
     """Pure decision. Returns dict with action in
     {allow, deny, defer, prompt} (+ reason / title / message)."""
@@ -454,6 +518,27 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     tinput = payload.get("tool_input", {}) or {}
     mode = payload.get("permission_mode", "default")
     cwd = payload.get("cwd") or os.getcwd()
+
+    # 0. Claude-to-human interaction tools are not permission gates — they're
+    #    the session waiting on a person (a question to answer, a plan to
+    #    review), and they block in EVERY permission mode: a bypass session
+    #    still stops on a question, and plan mode is precisely when
+    #    ExitPlanMode fires. So they're surfaced before the governed/mode
+    #    gates below — but a deny rule keeps its hard-floor guarantee here too.
+    surface = {"AskUserQuestion": ("surface_questions", render_question),
+               "ExitPlanMode": ("surface_plans", render_plan)}
+    if tool in surface:
+        flag, render = surface[tool]
+        if not cfg["approval"].get(flag, True):
+            return {"action": "defer", "reason": f"noti: {flag} off"}
+        if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd):
+            return {"action": "deny", "reason": "noti: matches a deny rule"}
+        d = render(tinput)
+        project = os.path.basename(cwd.rstrip("/"))
+        d.setdefault("project", project)
+        if d["action"] == "notice" and project:
+            d["footer"] = f"{project} · {d['footer']}"
+        return d
 
     # 1. Only govern the tools we were asked to.
     if not is_governed(tool, cfg):
@@ -519,6 +604,10 @@ def tally_record(payload: dict) -> None:
             data["webfetch"] += 1
         elif tool.startswith("mcp__"):
             data["mcp"] += 1
+        elif tool == "AskUserQuestion":
+            data["questions"] = data.get("questions", 0) + 1
+        elif tool == "ExitPlanMode":
+            data["plans"] = data.get("plans", 0) + 1
         atomic_write_json(path, data)
 
 
@@ -554,6 +643,10 @@ def format_tally(t) -> str:
         bits.append(f"fetched {t['webfetch']} url" + ("s" if t["webfetch"] != 1 else ""))
     if t.get("mcp"):
         bits.append(f"{t['mcp']} MCP action" + ("s" if t["mcp"] != 1 else ""))
+    if t.get("questions"):
+        bits.append(f"answered {t['questions']} question" + ("s" if t["questions"] != 1 else ""))
+    if t.get("plans"):
+        bits.append("approved a plan" if t["plans"] == 1 else f"approved {t['plans']} plans")
     return " · ".join(bits)
 
 
@@ -604,12 +697,65 @@ def clean_summary(msg: str, maxc: int) -> str:
 # hook handlers
 # ---------------------------------------------------------------------------
 
-def emit_pretool(decision: str, reason: str) -> None:
-    print(json.dumps({"hookSpecificOutput": {
+def emit_pretool(decision: str, reason: str, updated_input: dict | None = None) -> None:
+    out = {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
         "permissionDecisionReason": reason,
-    }}))
+    }
+    # updatedInput (allow only) is how a hook hands Claude Code pre-collected
+    # AskUserQuestion answers — the same channel its own permission UI uses.
+    # A Claude Code too old to know the field just ignores it and asks in the
+    # terminal: degraded, never wrong.
+    if updated_input is not None:
+        out["updatedInput"] = updated_input
+    print(json.dumps({"hookSpecificOutput": out}))
+
+
+def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
+    """Toast a single simple question; the buttons are the options. A click is
+    handed back as pre-collected `answers` via updatedInput, so the terminal
+    UI never appears. Esc / timeout / any error emits NO decision — the full
+    terminal UI (option descriptions, free-text Other) is the fallback."""
+    slot = acquire_slot()
+    try:
+        rc, _ = toast_ask(d["title"], d["message"], d["buttons"],
+                          cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
+                          hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                          kind="question", project=d.get("project", ""))
+    except Exception as e:
+        debug(f"question toast failed: {e}")
+        return 0
+    finally:
+        release_slot(slot)
+    if 0 <= rc < len(d["options"]):
+        tinput = dict(payload.get("tool_input") or {})
+        tinput["answers"] = {d["question"]: d["options"][rc]}
+        tally_record(payload)
+        emit_pretool("allow", "noti: question answered from toast", updated_input=tinput)
+    return 0
+
+
+def prompt_plan(payload: dict, cfg: dict, d: dict) -> int:
+    """Toast a plan-ready card. Approve is the fast path (Claude proceeds; the
+    implementation edits/commands still go through noti's approval toasts).
+    View / Esc / timeout emits NO decision — the terminal's plan UI, which can
+    actually show the whole plan and take feedback, handles it."""
+    slot = acquire_slot()
+    try:
+        rc, _ = toast_ask(d["title"], d["message"], ["Approve", "View"],
+                          cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
+                          hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                          kind="plan", project=d.get("project", ""))
+    except Exception as e:
+        debug(f"plan toast failed: {e}")
+        return 0
+    finally:
+        release_slot(slot)
+    if rc == 0:
+        tally_record(payload)
+        emit_pretool("allow", "noti: plan approved from toast")
+    return 0
 
 
 def hook_pretooluse(payload: dict) -> int:
@@ -626,6 +772,20 @@ def hook_pretooluse(payload: dict) -> int:
         return 0
     if action == "deny":
         emit_pretool("deny", d.get("reason", "noti: denied"))
+        return 0
+    if action == "question":
+        return prompt_question(payload, cfg, d)
+    if action == "plan":
+        return prompt_plan(payload, cfg, d)
+    if action == "notice":
+        # non-blocking heads-up (complex question set): no decision, just make
+        # sure the human knows the terminal is waiting on them
+        try:
+            toast_summary(d["title"], d["message"], cfg["toast"]["summary_timeout_seconds"],
+                          cfg["toast"]["corner"], kind=d.get("kind", "question"),
+                          footer=d.get("footer", ""))
+        except Exception as e:
+            debug(f"notice toast failed: {e}")
         return 0
 
     # action == "prompt": show the toast.
@@ -811,6 +971,10 @@ def cmd_install(a) -> int:
     pre_cmd = f"{py} {script} hook pretooluse"
     stop_cmd = f"{py} {script} hook stop"
     matcher = "|".join(cfg["approval"]["governed_tools"]) + ("|mcp__.*" if cfg["approval"]["govern_mcp"] else "")
+    if cfg["approval"].get("surface_questions", True):
+        matcher += "|AskUserQuestion"
+    if cfg["approval"].get("surface_plans", True):
+        matcher += "|ExitPlanMode"
     pre_timeout = int(cfg["toast"]["ask_timeout_seconds"]) + 30
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -891,6 +1055,15 @@ def cmd_doctor(a) -> int:
               for blk in gd.get("hooks", {}).get("PreToolUse", []) for h in blk.get("hooks", []))
     line("hooks installed (global)", has, "run `noti install` to wire up" if not has else str(g))
     cfg = load_config()
+    if has:
+        # an install predating question/plan surfacing has a matcher that
+        # filters those events out before noti ever runs — flag the drift
+        m = next((blk.get("matcher", "") for blk in gd.get("hooks", {}).get("PreToolUse", [])
+                  if any("noti" in h.get("command", "") for h in blk.get("hooks", []))), "")
+        stale = (cfg["approval"].get("surface_questions", True) and "AskUserQuestion" not in m) or \
+                (cfg["approval"].get("surface_plans", True) and "ExitPlanMode" not in m)
+        line("hook matcher current", not stale,
+             "matcher predates question/plan surfacing — `noti uninstall && noti install`" if stale else "")
     print(f"  governed: {', '.join(cfg['approval']['governed_tools'])}"
           f"{' + mcp__*' if cfg['approval']['govern_mcp'] else ''}")
     print(f"  ask timeout: {cfg['toast']['ask_timeout_seconds']}s · rule scope: {cfg['approval']['rule_scope']}")
@@ -898,7 +1071,7 @@ def cmd_doctor(a) -> int:
 
 
 def cmd_version(a) -> int:
-    print("noti 0.2.0")
+    print("noti 0.3.0")
     return 0
 
 # ---------------------------------------------------------------------------
@@ -916,7 +1089,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--buttons", default="Yes,No")
     a.add_argument("--timeout", type=float, default=None)
     a.add_argument("--corner", default=None)
-    a.add_argument("--kind", default="", help="run|edit|fetch|mcp|note — dot color + mono message")
+    a.add_argument("--kind", default="", help="run|edit|fetch|mcp|note|question|plan — icon chip; run/edit/fetch/mcp get a mono message")
     a.add_argument("--project", default="", help="eyebrow line above the title")
     a.set_defaults(fn=cmd_ask)
 
@@ -925,7 +1098,7 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--body", default="")
     n.add_argument("--timeout", type=float, default=None)
     n.add_argument("--corner", default=None)
-    n.add_argument("--kind", default="note", help="dot color: run|edit|fetch|mcp|note")
+    n.add_argument("--kind", default="note", help="icon chip: run|edit|fetch|mcp|note|question|plan")
     n.add_argument("--footer", default="", help="small monospaced footer line")
     n.set_defaults(fn=cmd_notify)
 

@@ -24,8 +24,9 @@ NOTI_SNAPSHOT="$DIR/summary.png" NOTI_TIMEOUT=30 NOTI_KIND=note \
 ```
 
 3. Read each PNG and critique: dynamic height fitting the content, keycap chips
-   legible, dot color matching the kind, nothing truncated or overlapping,
-   mono payload at full contrast.
+   legible, icon chip tint/glyph matching the kind, nothing truncated or
+   overlapping, mono payload at full contrast. Add `NOTI_APPEARANCE=light` (or
+   `dark`) to any command to force a palette — review both modes.
 4. Also snapshot an edge case relevant to the change (long wrapped command,
    custom button labels via a plain `./bin/noti-toast ask` with no NOTI_KIND,
    empty body summary).
