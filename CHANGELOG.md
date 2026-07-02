@@ -6,6 +6,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-02
+
+The "someone other than me can install it" release: a public-repo baseline
+(license, versioning, CI, screenshots), a universal binary that runs on both Mac
+architectures, hardened security around the auto-allow surface, and a `doctor`
+that diagnoses a stranger's most likely install problems.
+
+### Added
+- `LICENSE` (MIT) and a README license section.
+- A single `VERSION` constant driving a top-level `--version` flag, the `version`
+  subcommand, and the `doctor` header; `CHANGELOG.md`.
+- GitHub Actions CI on an Apple Silicon runner (ruff, universal build, the
+  headless policy suite, a best-effort toast-render smoke) with a README badge.
+- Rendered toast screenshots (approval / question / plan / summary, light and
+  dark) embedded in the README.
+- Universal toast binary: `./noti build` compiles arm64 + x86_64 slices pinned to
+  a macOS 11 floor and `lipo`s them together, swapping the result into place
+  atomically; a toolchain that can't cross-compile falls back to a native build.
+- `noti doctor` now checks the macOS/python floor, `~/.claude` presence, the
+  binary's architectures vs the host, whether the binary is older than its
+  source, and whether the installed hook points at this clone (moved / deleted /
+  foreign-clone detection).
+
+### Security
+- Closed write/exec holes in the Bash auto-allow safe-list: `git log/diff/show
+  --output=FILE` (arbitrary file write) and `--ext-diff` (external diff driver)
+  are now refused, and the mutating-capable `git branch` and `tree` were dropped
+  from the safe-list.
+- Deny-rule matching is now directional-broad: a bare trailing `*` in a Bash rule
+  is treated as a prefix for **deny** (so a deny can no longer be under-matched
+  and bypassed by the auto-allow), while **allow** matching stays strict.
+
+### Changed
+- `evaluate()` is now total against malformed / forward-incompatible hook
+  payloads (non-dict `tool_input`, non-string `tool_name`, missing fields):
+  every odd shape degrades to a defer or a safe prompt instead of raising.
+
+### Documentation
+- Honest install story ("the clone is the install — keep it; `git pull &&
+  ./noti build` to upgrade"), macOS 11+ / dual-arch requirements, and documented
+  limitations: safe-listed `cat`/`grep` can read any path, and enterprise
+  managed-settings deny rules are not read.
+
 ## [0.3.0] — 2026-07-01
 
 ### Added
@@ -44,6 +87,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
-[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mjbarefo/noti/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjbarefo/noti/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mjbarefo/noti/releases/tag/v0.2.0

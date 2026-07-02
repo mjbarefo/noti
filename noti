@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 # Deployment-target floor for the toast binary. The host toolchain default-
 # targets the build machine's OS (e.g. macosx15), which would stamp a minos the
 # binary refuses to launch under on older Macs — so `noti build` pins this
