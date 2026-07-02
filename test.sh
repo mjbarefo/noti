@@ -106,6 +106,24 @@ want("tree -o not safe",             not m.is_safe_bash("tree -o /tmp/x", cfg))
 want("exact rule matches itself",      m.pattern_matches("Bash", {"command":"rm -rf node_modules/*"}, "Bash(rm -rf node_modules/*)"))
 want("exact rule does NOT broaden", not m.pattern_matches("Bash", {"command":"rm -rf node_modules/../.ssh"}, "Bash(rm -rf node_modules/*)"))
 
+# v0.4 F11: DENY matching is directional-broad — a bare trailing * in a Bash
+# deny rule is a prefix (mirrors Claude), so noti can't under-match and let a
+# deny be bypassed. ALLOW matching stays strict (bare * literal) to preserve
+# the round-trip and stricter-than-Claude-for-allow.
+want("deny Bash(ls*) matches 'ls -la'",   m.pattern_matches("Bash", {"command":"ls -la"}, "Bash(ls*)", broad=True))
+want("deny Bash(ls*) matches 'lsof'",      m.pattern_matches("Bash", {"command":"lsof"}, "Bash(ls*)", broad=True))
+want("allow Bash(ls*) stays literal", not m.pattern_matches("Bash", {"command":"ls -la"}, "Bash(ls*)"))
+want("deny Bash(rm*) matches rm -rf /",    m.pattern_matches("Bash", {"command":"rm -rf /"}, "Bash(rm*)", broad=True))
+# end-to-end: a deny rule with a bare * must NOT be bypassed by the safe-list
+_save_lp = m.load_patterns
+m.load_patterns = lambda cwd, kind: (["Bash(ls*)"] if kind == "deny" else [])
+try:
+    dbz = m.evaluate({"tool_name":"Bash","tool_input":{"command":"ls -la"},
+                      "permission_mode":"default","cwd":sys.argv[1]}, cfg)
+    want("safe-list can't bypass a broad deny", dbz["action"] == "deny")
+finally:
+    m.load_patterns = _save_lp
+
 # F3: MCP auto-allow is opt-in and mutating-token aware
 want("mcp off by default",       not m.is_read_only_mcp("mcp__db__query", cfg))
 optin = copy.deepcopy(cfg); optin["approval"]["mcp_autoallow_servers"] = ["claude_ai_Gmail"]

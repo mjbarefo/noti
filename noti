@@ -325,14 +325,23 @@ def make_rule(tool: str, tinput: dict, cfg: dict):
     return None
 
 
-def _bash_match(cmd: str, inner: str) -> bool:
+def _bash_match(cmd: str, inner: str, broad: bool = False) -> bool:
     for suf in (":*", " *"):     # Claude's two word-boundary prefix spellings
         if inner.endswith(suf):
             prefix = inner[:-2].rstrip()
             return cmd == prefix or cmd.startswith(prefix + " ")   # 'git log' !~ 'git logger'
-    return cmd == inner          # a bare trailing * stays LITERAL here: Claude reads it as
-                                 # a prefix, but treating it that way would broaden what an
-                                 # allow rule covers — stricter is safe (worst case: a toast)
+    if broad and inner.endswith("*"):
+        # DENY matching (broad=True) must be at least as broad as Claude's own
+        # engine, or a deny rule noti fails to match is silently BYPASSED: noti
+        # returns no deny, then auto-allows via the safe-list, and a PreToolUse
+        # 'allow' overrides Claude's deny enforcement. Claude reads a bare
+        # trailing * as a raw prefix wildcard (Bash(ls*) matches 'lsof', not just
+        # 'ls '), so mirror that. Over-denying is the safe direction here.
+        return cmd.startswith(inner.rstrip("*"))
+    return cmd == inner          # ALLOW matching (broad=False) keeps a bare trailing
+                                 # * LITERAL: Claude reads it as a prefix, but treating
+                                 # it that way would broaden what an allow rule covers —
+                                 # stricter is safe there (worst case: an extra toast).
 
 
 def _glob_rx(pat: str) -> str:
@@ -364,7 +373,9 @@ def _host_match(host: str, dom: str) -> bool:
     return host == dom or host.endswith("." + dom)
 
 
-def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "") -> bool:
+def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "", broad: bool = False) -> bool:
+    # broad=True is DENY matching: widen a bare trailing * in a Bash rule to a
+    # prefix (see _bash_match) so noti can't under-match and bypass a deny.
     cwd = cwd or os.getcwd()
     if "(" not in pat:
         if pat == tool:
@@ -383,7 +394,7 @@ def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "") -> bool:
     if not name_ok:
         return False
     if tool == "Bash":
-        return _bash_match((tinput.get("command") or "").strip(), inner)
+        return _bash_match((tinput.get("command") or "").strip(), inner, broad)
     if tool in EDIT_TOOLS:
         return _path_match(tinput.get("file_path") or tinput.get("notebook_path") or "", inner, cwd)
     if tool == "WebFetch":
@@ -393,8 +404,8 @@ def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "") -> bool:
     return False
 
 
-def matches_any(tool: str, tinput: dict, patterns, cwd: str = "") -> bool:
-    return any(pattern_matches(tool, tinput, p, cwd) for p in patterns)
+def matches_any(tool: str, tinput: dict, patterns, cwd: str = "", broad: bool = False) -> bool:
+    return any(pattern_matches(tool, tinput, p, cwd, broad) for p in patterns)
 
 # ---------------------------------------------------------------------------
 # policy
@@ -546,7 +557,7 @@ def evaluate(payload: dict, cfg: dict) -> dict:
         flag, render = surface[tool]
         if not cfg["approval"].get(flag, True):
             return {"action": "defer", "reason": f"noti: {flag} off"}
-        if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd):
+        if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd, broad=True):
             return {"action": "deny", "reason": "noti: matches a deny rule"}
         d = render(tinput)
         project = os.path.basename(cwd.rstrip("/"))
@@ -563,7 +574,7 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     #    bypass/plan/acceptEdits short-circuits. A deny rule is the user's hard
     #    floor; PreToolUse hooks still fire (and may block) in bypass mode, so
     #    noti enforces the deny rather than letting a permissive mode override it.
-    if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd):
+    if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd, broad=True):
         return {"action": "deny", "reason": "noti: matches a deny rule"}
 
     # 3. Respect the user's chosen permission mode (after deny). dontAsk means
