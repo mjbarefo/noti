@@ -1,7 +1,11 @@
 bin/noti-toast
+bin/.noti-toast.*
 *.tmp.*
 .DS_Store
 .claude/settings.local.json
+# noti writes these when it edits a settings file (see write_rule / cmd_install)
+*.noti-prev
+*.noti-backup-*
 .venv/
 .ruff_cache/
 
