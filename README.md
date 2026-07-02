@@ -14,13 +14,16 @@ surfaces only the moments a human is actually needed:
    **y / a / n** (Esc = fall back to the terminal prompt). A hairline drains
    along the bottom edge — when it empties, the prompt moves to the terminal.
 2. **Questions & plans** — when Claude asks a multiple-choice question
-   (`AskUserQuestion`), a single question with 2–4 options becomes a toast that
+   (`AskUserQuestion`), each question with 2–4 options becomes a toast that
    renders them as a numbered list — full labels, each with its description —
    the same shape as the terminal picker, so pressing **1/2/3/4** (or one
-   click) answers it (the hook returns the answer via `updatedInput`, and the
-   terminal picker never appears). Multi-question or multi-select sets get a
+   click) answers it (the hook returns the answers via `updatedInput`, and the
+   terminal picker never appears). A call carrying several questions shows one
+   card per question in turn (`noti · 2 of 3` in the eyebrow), all sharing one
+   deadline; answers are all-or-nothing, so Esc or timeout on any card sends
+   the **whole set** to the terminal, fresh. Multi-select sets get a
    non-blocking heads-up toast instead — the terminal UI (full descriptions,
-   free-text "Other") owns those, and Esc on any question card hands off to it. When a
+   free-text "Other") owns those. When a
    plan is ready (`ExitPlanMode`), the toast shows a preview with
    **Approve / View**: Approve accepts the plan (implementation still goes
    through approval toasts); View, Esc, or timeout hands you the full plan UI
@@ -76,8 +79,9 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
                                                                     ├ No ───▶ deny
                                                                     └ (timeout) ▶ ask  (fall back to
                                                                                  Claude's terminal prompt)
-                 AskUserQuestion ─▶ numbered option list ─▶ answer via updatedInput
-                                    (multi-question/-select: heads-up toast, answer in terminal)
+                 AskUserQuestion ─▶ numbered option list, one card per question
+                                    ─▶ all answers via updatedInput (all-or-nothing;
+                                    multi-select: heads-up toast, answer in terminal)
                  ExitPlanMode ────▶ Approve ─▶ allow  ·  View/timeout ─▶ terminal plan UI
 Stop hook ──────▶ trimmed last message + tool tally ─▶ non-blocking summary toast
 ```
@@ -200,9 +204,13 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   it simply ignores the field and asks in the terminal — degraded, never a
   wrong answer. The toast shows display *copies* of the labels (sanitized,
   length-capped) but always answers with the raw strings by index, so display
-  trimming can never change what Claude hears. Anything the toast can't
-  represent faithfully (multi-select, several questions at once, 5+ options,
-  free-text "Other") is never answered from the toast at all.
+  trimming can never change what Claude hears. Multi-question calls are
+  answered **all-or-nothing**: partial-`answers` behavior is undocumented
+  upstream, so if any card in the set is dismissed, everything collected is
+  discarded and the terminal asks the full set fresh — noti never submits a
+  half-answered call. Anything the toast can't represent faithfully
+  (multi-select, 5+ options, free-text "Other") is never answered from the
+  toast at all.
 - **Hotkeys are hover-armed.** The toast only captures the keyboard after the
   mouse *moves* over it, and releases it the moment the mouse leaves. A toast
   appearing while you type — even directly under a parked cursor — can never

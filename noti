@@ -548,45 +548,70 @@ def render_call(tool: str, tinput: dict):
 
 
 def render_question(tinput: dict) -> dict:
-    """AskUserQuestion -> decision dict. One single-select question with 2-4
-    options becomes a 'question' toast rendered as a vertical option list —
-    full labels with their descriptions, answered without touching the
-    terminal. Anything richer (several questions, multiSelect, 5+ options —
-    and the terminal UI also owns free-text "Other") becomes a non-blocking
-    'notice' so the human knows the session is waiting on them."""
-    qs = [q for q in (tinput.get("questions") or []) if isinstance(q, dict)]
-    if len(qs) == 1 and not qs[0].get("multiSelect"):
-        q = qs[0]
-        # harvest labels + descriptions in ONE loop so they stay index-aligned
-        # (the toast's exit code indexes both). Read only the two known keys:
-        # real transcripts carry nonstandard extras ("preview" with multi-line
-        # ASCII art) that must never reach a toast.
-        options, descs = [], []
-        for o in (q.get("options") or []):
-            label = str(o.get("label") or "") if isinstance(o, dict) else str(o)
-            # filter on the SANITIZED form, not truthiness: a whitespace- or
-            # control-char-only label collapses to an empty NOTI_OPTIONS field,
-            # and one empty field would knock the whole card off the list
-            # layout onto the 3-button fallback — silently hiding a real
-            # 4th option. Drop just the degenerate option instead.
-            if _display_line(label):
-                options.append(label)
-                descs.append(str(o.get("description") or "") if isinstance(o, dict) else "")
-        if 2 <= len(options) <= 4:
+    """AskUserQuestion -> decision dict. A call whose EVERY question is simple
+    — single-select, 2-4 usable options — becomes a 'question' decision with
+    one item per question; prompt_question shows one vertical-list card per
+    item and answers the whole set. Answers are all-or-nothing (a partial
+    `answers` dict would mark the omitted questions as answered too), so if
+    ANY question is richer than a card can faithfully represent (multiSelect,
+    5+ options — and the terminal UI also owns free-text "Other"), the whole
+    call becomes a non-blocking 'notice' instead: never a partially-answered
+    set."""
+    raw = tinput.get("questions")
+    raw = raw if isinstance(raw, list) else []
+    qs = [q for q in raw if isinstance(q, dict)]
+    # Eligibility requires EVERY raw entry to be a well-formed dict: a stray
+    # non-dict member is invisible to the cards yet still part of the call,
+    # so the emitted answers dict would cover fewer questions than the call
+    # carries — the partial-answers shape the all-or-nothing contract forbids.
+    items = []
+    if 1 <= len(qs) <= 4 and len(qs) == len(raw):
+        for q in qs:
+            qtext = str(q.get("question") or "")
+            # answers are keyed by the question's exact text; text that
+            # sanitizes to nothing would key an answer by "" — undefined
+            # matching upstream, another partial answer in disguise
+            if q.get("multiSelect") or not _display_line(qtext):
+                items = []
+                break
+            # harvest labels + descriptions in ONE loop so they stay
+            # index-aligned (the toast's exit code indexes both). Read only
+            # the two known keys: real transcripts carry nonstandard extras
+            # ("preview" with multi-line ASCII art) that must never reach a
+            # toast.
+            options, descs = [], []
+            for o in (q.get("options") or []):
+                label = str(o.get("label") or "") if isinstance(o, dict) else str(o)
+                # filter on the SANITIZED form, not truthiness: a whitespace-
+                # or control-char-only label collapses to an empty
+                # NOTI_OPTIONS field, and one empty field would knock the
+                # whole card off the list layout onto the 3-button fallback —
+                # silently hiding a real 4th option. Drop just the degenerate
+                # option instead.
+                if _display_line(label):
+                    options.append(label)
+                    descs.append(str(o.get("description") or "") if isinstance(o, dict) else "")
+            if not (2 <= len(options) <= 4):
+                items = []
+                break
             header = str(q.get("header") or "").strip()
-            return {"action": "question",
-                    "title": f"Claude asks — {header}" if header else "Claude asks",
-                    "message": trunc(str(q.get("question") or ""), 220),
-                    # full texts, not the truncated button labels: `answers`
-                    # must be keyed by the exact question, valued by the exact
-                    # option label, or Claude Code won't recognise the answer
-                    "question": str(q.get("question") or ""),
-                    "options": options,
-                    "descriptions": descs,
-                    # argv fallbacks for a stale binary (which prefix(3)s
-                    # them); the list layout reads NOTI_OPTIONS instead.
-                    # Buttons are pure display — sanitized copy there too.
-                    "buttons": [trunc(_display_line(o), 16) for o in options]}
+            items.append({
+                "title": f"Claude asks — {header}" if header else "Claude asks",
+                "message": trunc(qtext, 220),
+                # full texts, not the truncated button labels: `answers`
+                # must be keyed by the exact question, valued by the exact
+                # option label, or Claude Code won't recognise the answer
+                "question": qtext,
+                "options": options,
+                "descriptions": descs,
+                # argv fallbacks for a stale binary (which prefix(3)s
+                # them); the list layout reads NOTI_OPTIONS instead.
+                # Buttons are pure display — sanitized copy there too.
+                "buttons": [trunc(_display_line(o), 16) for o in options]})
+    # duplicate question texts would collapse into one `answers` key — a
+    # partially-answered set in disguise. The terminal owns that shape.
+    if items and len({i["question"] for i in items}) == len(items):
+        return {"action": "question", "items": items}
     n = len(qs)
     first = trunc(str(qs[0].get("question") or ""), 160) if qs else ""
     return {"action": "notice", "kind": "question",
@@ -725,7 +750,11 @@ def tally_record(payload: dict) -> None:
         elif tool.startswith("mcp__"):
             data["mcp"] += 1
         elif tool == "AskUserQuestion":
-            data["questions"] = data.get("questions", 0) + 1
+            # one call can carry several questions; the tally counts what the
+            # human actually answered (dict entries only — the cards' shape)
+            qs = tinput.get("questions")
+            nq = sum(1 for q in qs if isinstance(q, dict)) if isinstance(qs, list) else 0
+            data["questions"] = data.get("questions", 0) + (nq or 1)
         elif tool == "ExitPlanMode":
             data["plans"] = data.get("plans", 0) + 1
         atomic_write_json(path, data)
@@ -833,31 +862,65 @@ def emit_pretool(decision: str, reason: str, updated_input: dict | None = None) 
 
 
 def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
-    """Toast a single simple question; the buttons are the options. A click is
-    handed back as pre-collected `answers` via updatedInput, so the terminal
-    UI never appears. Esc / timeout / any error emits NO decision — the full
-    terminal UI (option descriptions, free-text Other) is the fallback."""
+    """Toast each question in the call in turn — one card per question, with
+    an "i of n" eyebrow when there are several — and hand every click back as
+    pre-collected `answers` via updatedInput, so the terminal UI never
+    appears. ALL-or-nothing: `answers` marks the whole call answered (partial-
+    dict behavior is undocumented), so Esc / timeout / any error on ANY card
+    discards everything collected so far and emits NO decision — the terminal
+    UI asks the full set fresh, with the full descriptions and free-text
+    "Other" it alone owns. The set shares ONE deadline (ask_timeout_seconds
+    total; each card's drain shows what's actually left) because the installed
+    hook timeout (ask_timeout + 30, sized for a single card) blocks the tool
+    call outright when exceeded — per-card budgets would blow through it."""
+    items = d.get("items") or []
+    n = len(items)
+    if not n:
+        return 0
+    # floor the budget at 4s so a pathological ask_timeout config (<= 3s)
+    # still shows the first card briefly instead of silently skipping straight
+    # to the terminal with no visual signal at all
+    deadline = time.monotonic() + max(float(cfg["toast"]["ask_timeout_seconds"]), 4.0)
+    answers = {}
     slot = acquire_slot()
     try:
-        rc, _ = toast_ask(d["title"], d["message"], d["buttons"],
-                          cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
-                          hotkeys=bool(cfg["toast"].get("hotkeys", True)),
-                          kind="question", project=d.get("project", ""),
-                          # full labels + descriptions ride in env for the list
-                          # layout; the footer advertises the terminal escape
-                          # hatch (descriptions in full, free-text "Other")
-                          options=d.get("options"), descriptions=d.get("descriptions"),
-                          footer="esc · answer in terminal")
+        for i, item in enumerate(items):
+            remaining = deadline - time.monotonic()
+            if remaining < 3:           # too little time left to read a card
+                return 0
+            project = d.get("project", "")
+            if n > 1:
+                project = f"{project} · {i + 1} of {n}" if project else f"{i + 1} of {n}"
+            rc, _ = toast_ask(item["title"], item["message"], item["buttons"],
+                              remaining, cfg["toast"]["corner"], slot,
+                              hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                              kind="question", project=project,
+                              # full labels + descriptions ride in env for the
+                              # list layout; the footer advertises the terminal
+                              # escape hatch
+                              options=item["options"], descriptions=item["descriptions"],
+                              footer="esc · answer in terminal")
+            if not (0 <= rc < len(item["options"])):
+                return 0
+            answers[item["question"]] = item["options"][rc]
+            if i < n - 1:
+                # the card's own atexit deleted the slot file; re-claim the
+                # slot before the next card spawns, or a concurrent session
+                # slides into the gap (two cards overlaying at one position)
+                # and the release below would unlink THEIR live claim
+                try:
+                    (SLOT_DIR / f"slot-{slot}").touch()
+                except Exception:
+                    pass
     except Exception as e:
         debug(f"question toast failed: {e}")
         return 0
     finally:
         release_slot(slot)
-    if 0 <= rc < len(d["options"]):
-        tinput = dict(payload.get("tool_input") or {})
-        tinput["answers"] = {d["question"]: d["options"][rc]}
-        tally_record(payload)
-        emit_pretool("allow", "noti: question answered from toast", updated_input=tinput)
+    tinput = dict(payload.get("tool_input") or {})
+    tinput["answers"] = answers
+    tally_record(payload)
+    emit_pretool("allow", "noti: question answered from toast", updated_input=tinput)
     return 0
 
 

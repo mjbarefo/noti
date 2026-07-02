@@ -55,7 +55,12 @@ check "auto mode still governs"     "$(j Bash '{"command":"rm -rf build"}' auto)
 check "simple question toasts"      "$(j AskUserQuestion '{"questions":[{"question":"Which auth approach?","header":"Auth","options":[{"label":"JWT"},{"label":"Sessions"},{"label":"OAuth"}],"multiSelect":false}]}' default)" question
 check "question surfaces in bypass" "$(j AskUserQuestion '{"questions":[{"question":"Proceed?","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}' bypassPermissions)" question
 check "multiSelect question notifies" "$(j AskUserQuestion '{"questions":[{"question":"Pick features","options":[{"label":"A"},{"label":"B"}],"multiSelect":true}]}' default)" notice
-check "multi-question notifies"     "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"}]}]}' default)" notice
+check "multi-question toasts (all simple)" "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"}]}]}' default)" question
+check "multi-question w/ multiSelect notifies" "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"}],"multiSelect":true}]}' default)" notice
+check "multi-question w/ 5-option notifies" "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"C"},{"label":"D"},{"label":"E"},{"label":"F"},{"label":"G"}]}]}' default)" notice
+check "5 questions notify"          "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},{"question":"Q2","options":[{"label":"A"},{"label":"B"}]},{"question":"Q3","options":[{"label":"A"},{"label":"B"}]},{"question":"Q4","options":[{"label":"A"},{"label":"B"}]},{"question":"Q5","options":[{"label":"A"},{"label":"B"}]}]}' default)" notice
+check "non-dict question entry notifies" "$(j AskUserQuestion '{"questions":[{"question":"Q1","options":[{"label":"A"},{"label":"B"}]},"stray-junk"]}' default)" notice
+check "empty question text notifies" "$(j AskUserQuestion '{"questions":[{"header":"Pick","options":[{"label":"A"},{"label":"B"}]}]}' default)" notice
 check "4-option question toasts"    "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"}]}]}' default)" question
 check "5-option question notifies"  "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"},{"label":"E"}]}]}' default)" notice
 check "plan review toasts (plan mode)" "$(j ExitPlanMode '{"plan":"# Plan\n1. do the thing"}' plan)" plan
@@ -251,8 +256,8 @@ d4 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q,
                  "permission_mode": "dontAsk", "cwd": sys.argv[1]}, cfg)
 want("question surfaces even in dontAsk", d4["action"] == "question")
 want("question keeps exact answer strings",
-     d4.get("question") == q["questions"][0]["question"]
-     and d4.get("options") == ["JWT with long refresh tokens", "Server-side sessions"])
+     d4["items"][0]["question"] == q["questions"][0]["question"]
+     and d4["items"][0]["options"] == ["JWT with long refresh tokens", "Server-side sessions"])
 offcfg = copy.deepcopy(cfg); offcfg["approval"]["surface_plans"] = False
 d5 = m.evaluate({"tool_name": "ExitPlanMode", "tool_input": {"plan": "x"},
                  "permission_mode": "plan", "cwd": sys.argv[1]}, offcfg)
@@ -274,15 +279,16 @@ q2 = {"questions": [{"question": "Which release flow?",
                      "multiSelect": False}]}
 d6 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q2,
                  "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+i6 = d6["items"][0]
 want("question w/ descriptions toasts", d6["action"] == "question")
 want("options keep exact raw strings",
-     d6["options"] == ["Commits + v0.4.0 tag (Recommended)", "Commits + both tags",
+     i6["options"] == ["Commits + v0.4.0 tag (Recommended)", "Commits + both tags",
                        "Bare string option"])
 want("descriptions index-aligned (bare option = '')",
-     d6["descriptions"] == ["Tag the release now.", "Tag v0.4.0 and v0.5.0.", ""])
-want("unknown option keys never leak", all("ASCII-ART" not in str(v) for v in d6.values()))
+     i6["descriptions"] == ["Tag the release now.", "Tag v0.4.0 and v0.5.0.", ""])
+want("unknown option keys never leak", "ASCII-ART" not in repr(d6))
 want("argv buttons stay stale-binary safe",
-     d6["buttons"] == [m.trunc(m._display_line(o), 16) for o in d6["options"]])
+     i6["buttons"] == [m.trunc(m._display_line(o), 16) for o in i6["options"]])
 
 # critic HIGH: a whitespace/control-only label sanitizes to an empty
 # NOTI_OPTIONS field, and ONE empty field would kick the whole card off the
@@ -296,12 +302,13 @@ qws = {"questions": [{"question": "Pick one",
                       "multiSelect": False}]}
 dws = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": qws,
                   "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+iws = dws["items"][0]
 want("degenerate labels dropped, real options kept",
-     dws["action"] == "question" and dws["options"] == ["Alpha", "Delta (Recommended)"])
-want("descriptions realigned after the drop", dws["descriptions"] == ["", ""])
+     dws["action"] == "question" and iws["options"] == ["Alpha", "Delta (Recommended)"])
+want("descriptions realigned after the drop", iws["descriptions"] == ["", ""])
 want("no empty NOTI_OPTIONS field can reach the binary",
      all(f for f in m._toast_env(5, None, "top-right",
-                                 options=dws["options"])["NOTI_OPTIONS"].split("\x1f")))
+                                 options=iws["options"])["NOTI_OPTIONS"].split("\x1f")))
 
 want("_display_line strips controls", m._display_line("a\x1fb\nc\x00d") == "a b c d")
 envd = m._toast_env(5, None, "top-right",
@@ -332,7 +339,11 @@ d7 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q4,
                  "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
 _save_ask = m.toast_ask
 def _run_prompt(rc):
-    m.toast_ask = lambda *a, **k: (rc, "")
+    calls = []
+    def fake(title, message, buttons, timeout, corner, slot, **k):
+        calls.append({"timeout": timeout, "project": k.get("project", "")})
+        return (rc, "")
+    m.toast_ask = fake
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -340,12 +351,85 @@ def _run_prompt(rc):
                                "session_id": "t", "cwd": sys.argv[1]}, cfg, dict(d7))
     finally:
         m.toast_ask = _save_ask
-    return buf.getvalue()
-out3 = _run_prompt(3)
+    return buf.getvalue(), calls
+out3, calls3 = _run_prompt(3)
 want("rc=3 answers with exact 4th option",
      '"Delta (Recommended)"' in out3 and '"permissionDecision": "allow"' in out3)
-want("rc=124 (esc/timeout) emits no decision", _run_prompt(124).strip() == "")
-want("junk exit code emits no decision", _run_prompt(7).strip() == "")
+# a single-question card must be byte-identical to the pre-multi design: no
+# "1 of 1" progress suffix may ever appear on its eyebrow
+want("single question card has no progress suffix", " of " not in calls3[0]["project"])
+want("rc=124 (esc/timeout) emits no decision", _run_prompt(124)[0].strip() == "")
+want("junk exit code emits no decision", _run_prompt(7)[0].strip() == "")
+
+# v0.5.x: multi-question calls toast sequentially and answer ALL-or-nothing —
+# a partial `answers` dict would mark the omitted questions answered (behavior
+# undocumented upstream), so an esc/timeout on ANY card must discard the set.
+# The set shares ONE deadline: the installed hook timeout (ask+30) blocks the
+# tool call outright when exceeded, so per-card budgets are forbidden.
+qm = {"questions": [
+    {"question": "Q-one?", "header": "One",
+     "options": [{"label": "A1"}, {"label": "B1"}], "multiSelect": False},
+    {"question": "Q-two?", "header": "Two",
+     "options": [{"label": "A2"}, {"label": "B2"}, {"label": "C2"}], "multiSelect": False},
+    {"question": "Q-three?",
+     "options": [{"label": "A3"}, {"label": "B3"}], "multiSelect": False}]}
+dm = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": qm,
+                 "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+want("multi-question call toasts with one item per question",
+     dm["action"] == "question" and len(dm["items"]) == 3)
+
+# the fake clock advances `advance` seconds inside each card, so deadline
+# shrinkage is OBSERVABLE — a per-card-budget mutant (fresh ask_timeout per
+# card, which would blow through the ask+30 hook timeout Claude Code kills
+# hooks at) fails the exact-sequence assertion below
+_real_mono = m.time.monotonic
+def _run_multi(rcs, use_cfg=cfg, advance=10.0):
+    seq = list(rcs); calls = []
+    clock = {"t": 1000.0}
+    def fake(title, message, buttons, timeout, corner, slot, **k):
+        calls.append({"timeout": timeout, "project": k.get("project", "")})
+        clock["t"] += advance
+        return (seq.pop(0), "")
+    m.toast_ask = fake
+    m.time.monotonic = lambda: clock["t"]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            m.prompt_question({"tool_name": "AskUserQuestion", "tool_input": qm,
+                               "session_id": "t", "cwd": sys.argv[1]}, use_cfg, dict(dm))
+    finally:
+        m.toast_ask = _save_ask
+        m.time.monotonic = _real_mono
+    return buf.getvalue(), calls
+
+out_all, calls = _run_multi([1, 2, 0])
+ans = json.loads(out_all)["hookSpecificOutput"]["updatedInput"]["answers"]
+want("multi answers complete + exact strings",
+     ans == {"Q-one?": "B1", "Q-two?": "C2", "Q-three?": "A3"})
+want("progress eyebrow counts the cards",
+     calls[0]["project"].endswith("1 of 3") and calls[2]["project"].endswith("3 of 3"))
+_ask = float(cfg["toast"]["ask_timeout_seconds"])
+want("set shares ONE shrinking deadline (never a fresh per-card budget)",
+     [c["timeout"] for c in calls] == [_ask, _ask - 10.0, _ask - 20.0])
+out_esc, calls_esc = _run_multi([1, 124, 0])
+want("esc mid-set discards ALL answers (no partial updatedInput)",
+     out_esc.strip() == "" and len(calls_esc) == 2)
+out_dry, calls_dry = _run_multi([0, 0, 0], advance=50.0)
+want("mid-set budget exhaustion discards the set",
+     out_dry.strip() == "" and len(calls_dry) == 2)
+tinycfg = copy.deepcopy(cfg); tinycfg["toast"]["ask_timeout_seconds"] = 0
+out_tiny, calls_tiny = _run_multi([0, 0, 0], use_cfg=tinycfg)
+want("pathological tiny config still shows the first card (4s floor)",
+     out_tiny.strip() == "" and len(calls_tiny) == 1 and calls_tiny[0]["timeout"] == 4.0)
+
+# duplicate question texts would collapse into one answers key — a partial
+# answer in disguise; the whole call must fall to the notice
+qdup = {"questions": [
+    {"question": "Same?", "options": [{"label": "A"}, {"label": "B"}]},
+    {"question": "Same?", "options": [{"label": "C"}, {"label": "D"}]}]}
+want("duplicate question texts -> notice",
+     m.evaluate({"tool_name": "AskUserQuestion", "tool_input": qdup,
+                 "permission_mode": "default", "cwd": sys.argv[1]}, cfg)["action"] == "notice")
 
 # v0.4: evaluate() is TOTAL against malformed / forward-incompatible payloads.
 # Claude Code's hook JSON has shifted across versions and a stranger may run an

@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Multi-question calls now toast** (33% of real usage; previously always a
+  heads-up notice). A call carrying 2–4 simple questions shows one option-list
+  card per question in sequence, with a `2 of 3` progress eyebrow. Answers are
+  **all-or-nothing**: partial-`answers` behavior is undocumented upstream, so
+  Esc/timeout on any card discards everything collected and the terminal asks
+  the full set fresh. The set shares one deadline (`ask_timeout_seconds` total,
+  each card's drain showing what's left) — staying inside the installed hook
+  timeout, which blocks the tool call outright when exceeded. Calls with
+  duplicate question texts (they'd collapse into one `answers` key), empty
+  question text, non-dict entries in `questions`, or any non-simple question
+  still get the notice — every shape that could smuggle in a partial answer
+  is excluded. The turn tally now counts the questions actually answered,
+  not the calls.
+
 ### Changed
 - **Question cards render options as a vertical numbered list** instead of a
   horizontal button row. Labels show in full (2-line wrap with a real ellipsis)
