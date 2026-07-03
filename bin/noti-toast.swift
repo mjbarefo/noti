@@ -25,10 +25,10 @@
 //                 sliding up when a neighbour dismisses.
 //   NOTI_CORNER   top-right (default) | bottom-right | top-left | bottom-left
 //   NOTI_HOTKEYS  "0" disables hover-armed keyboard shortcuts (default on)
-//   NOTI_KIND     run | edit | fetch | mcp | note | question | plan — tints
-//                 the icon chip and picks its glyph; run/edit/fetch/mcp set
-//                 the message in monospace (terminal text is the material),
-//                 question/plan stay prose
+//   NOTI_KIND     run | edit | fetch | mcp | tool | note | question | plan —
+//                 tints the icon chip and picks its glyph; run/edit/fetch/
+//                 mcp/tool set the message in monospace (terminal text is
+//                 the material), question/plan stay prose
 //   NOTI_PROJECT  eyebrow line above the title (which session is asking)
 //   NOTI_FOOTER   small monospaced footer line (summary: the tool tally;
 //                 ask: rendered in list mode only — the esc hint)
@@ -113,7 +113,7 @@ if let forced = env["NOTI_APPEARANCE"] {
 func targetScreen() -> NSScreen {
     let mouse = NSEvent.mouseLocation
     for s in NSScreen.screens where NSMouseInRect(mouse, s.frame, false) { return s }
-    return NSScreen.main ?? NSScreen.screens.first ?? NSScreen.screens[0]
+    return NSScreen.main ?? NSScreen.screens[0]
 }
 
 // ----------------------------------------------------------------------------

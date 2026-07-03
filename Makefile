@@ -1,5 +1,4 @@
 BINARY := bin/noti-toast
-SRC    := bin/noti-toast.swift
 
 .PHONY: build install uninstall doctor clean test hooks
 

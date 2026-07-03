@@ -1,6 +1,6 @@
 # noti v0.4.0 — installable by someone who isn't me
 
-*Draft release notes. Not yet published.*
+*Published as [v0.4.0](https://github.com/mjbarefo/noti/releases/tag/v0.4.0) on 2026-07-02.*
 
 v0.4.0 turns noti from a personal setup into something a stranger can clone,
 trust, and install in five minutes on either Mac architecture — with a hardened

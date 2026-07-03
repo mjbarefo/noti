@@ -89,7 +89,7 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
 Stop hook ──────▶ trimmed last message + tool tally ─▶ non-blocking summary toast
 ```
 
-The UI is a ~170-line borderless `NSPanel` Swift binary (`bin/noti-toast.swift`)
+The UI is a single-file borderless `NSPanel` Swift binary (`bin/noti-toast.swift`)
 with **zero dependencies** and no special macOS permissions — it doesn't steal
 focus or switch Spaces. The policy + hook glue is one dependency-free Python
 file (`noti`).

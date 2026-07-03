@@ -94,8 +94,7 @@ DEFAULT_CONFIG = {
         # keeps the sentinel in the junk bucket).
         "question_other": True,
         # Bash commands that auto-allow silently (only when they contain NO shell
-        # metacharacters). Keep this list genuinely read-only.
-        # Genuinely read-only verbs only. NOT env/find/rg — those can exec or
+        # metacharacters). Genuinely read-only verbs only. NOT env/find/rg — those can exec or
         # delete without any shell metacharacter (env <prog>, find -delete, rg --pre).
         # NOT `git branch` — bare listing is niche and the prefix also covers the
         # mutating `git branch NAME` / `-D` / `-m`. NOT `tree` — its `-o FILE`
@@ -1498,8 +1497,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if not hasattr(args, "project"):
-        args.project = None
     return args.fn(args) or 0
 
 

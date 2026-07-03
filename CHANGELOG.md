@@ -30,7 +30,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all four quadrants: an old binary ignores the flag (Esc → terminal keeps
   owning Other); an old Python drops exit-10 in its junk bucket (no decision →
   terminal). The row is pure UI — the decision dict, `NOTI_OPTIONS` arity, and
-  card eligibility are byte-identical to v0.5.
+  card eligibility are byte-identical to the option-list cards introduced below.
 - **Multi-question calls now toast** (33% of real usage; previously always a
   heads-up notice). A call carrying 2–4 simple questions shows one option-list
   card per question in sequence, with a `2 of 3` progress eyebrow. Answers are

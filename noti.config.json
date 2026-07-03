@@ -11,6 +11,9 @@
   "approval": {
     "governed_tools": ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch"],
     "govern_mcp": true,
+    "surface_questions": true,
+    "surface_plans": true,
+    "question_other": true,
     "bash_safe_commands": [
       "ls", "pwd", "cat", "echo", "git status", "git diff", "git log",
       "git show", "which", "head", "tail", "wc",

@@ -90,7 +90,7 @@ PY
 rt=$?
 
 echo
-echo "security regressions (the 8 review findings must stay fixed)"
+echo "security regressions (fixed review findings must stay fixed)"
 python3 - "$CWD" <<'PY'
 import sys, copy
 from importlib.machinery import SourceFileLoader
