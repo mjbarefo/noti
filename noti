@@ -84,6 +84,15 @@ DEFAULT_CONFIG = {
         # buttons ARE the options; plans become an Approve/View card.
         "surface_questions": True,
         "surface_plans": True,
+        # Free-text "Other" row on question cards. Kill-switch, not a feature
+        # flag: the upstream contract (updatedInput accepting NON-label answer
+        # values) is observed behavior — spike-verified 2026-07-02 on Claude
+        # Code 2.1.198, byte-exact incl. edge whitespace and unicode — not
+        # documented API. If a future Claude Code rejects non-label answers,
+        # set False to recover without a code change. OFF must both hide the
+        # row (NOTI_OTHER never set) AND reject a rogue rc=10 (prompt_question
+        # keeps the sentinel in the junk bucket).
+        "question_other": True,
         # Bash commands that auto-allow silently (only when they contain NO shell
         # metacharacters). Keep this list genuinely read-only.
         # Genuinely read-only verbs only. NOT env/find/rg — those can exec or
@@ -202,21 +211,43 @@ def home_short(p: str) -> str:
 # toast invocation
 # ---------------------------------------------------------------------------
 
+# Exit-code space of `noti-toast ask` (keep in sync with bin/noti-toast.swift):
+#   0..3   option/button index (Handler.tap; Python maps index -> exact string)
+#   10     RC_OTHER — free-text "Other" submitted; stdout carries the typed
+#          answer (the ONE path where stdout is the answer, not display copy)
+#   64/70  usage error / internal cast failure (sysexits)
+#   124    timeout, or Esc while armed — no answer
+#   <0     signal death (subprocess returncode convention)
+# RC_OTHER is FIXED, not len(options): unambiguous at every option count,
+# greppable in both languages, clear of the option cap (0..3) with headroom,
+# below the sysexits range, never colliding with 124/126/127/128+n. On an old
+# Python, rc=10 lands in the junk bucket (no decision -> terminal): degraded,
+# never wrong.
+RC_OTHER = 10
+
+
 def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
                kind: str = "", project: str = "", footer: str = "",
-               options=None, descs=None) -> dict:
+               options=None, descs=None, other: bool = False) -> dict:
     env = dict(os.environ)
     # Scrub BEFORE conditionally setting: dict(os.environ) inherits the parent
     # env, and a stray exported NOTI_OPTIONS would flip a permission prompt
-    # into the option-list layout with labels noti never chose.
+    # into the option-list layout with labels noti never chose — and a stray
+    # NOTI_OTHER would bolt a free-text field onto a permission prompt.
     env.pop("NOTI_OPTIONS", None)
     env.pop("NOTI_DESCS", None)
+    env.pop("NOTI_OTHER", None)
     if options:
         # full option labels for the vertical list layout; argv still carries
         # the truncated fallbacks so a stale binary renders the classic card
         env["NOTI_OPTIONS"] = "\x1f".join(trunc(_display_line(o), 120) for o in options)
         if descs and len(descs) == len(options) and any(descs):
             env["NOTI_DESCS"] = "\x1f".join(trunc(_display_line(x), 200) for x in descs)
+        if other:
+            # list-mode only (gated on options): offers the card's free-text
+            # "Other" row. A stale binary ignores the flag — no row, Esc ->
+            # terminal keeps owning Other. See RC_OTHER above for the wire.
+            env["NOTI_OTHER"] = "1"
     env["NOTI_TIMEOUT"] = str(timeout)
     env["NOTI_CORNER"] = corner
     env["NOTI_HOTKEYS"] = "1" if hotkeys else "0"
@@ -235,16 +266,29 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
 
 
 def toast_ask(title, message, buttons, timeout, corner, slot, hotkeys=True,
-              kind="", project="", options=None, descriptions=None, footer=""):
-    """Blocking. Returns (returncode, label). returncode 124 == timed out."""
+              kind="", project="", options=None, descriptions=None, footer="",
+              other=False):
+    """Blocking. Returns (returncode, text). returncode 124 == timed out.
+    text is display copy (the clicked label) — EXCEPT when returncode ==
+    RC_OTHER, where it is the user's typed free-text answer and stdout is
+    load-bearing (prompt_question validates it independently)."""
     if not BINARY.exists():
         raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
     proc = subprocess.run(
         [str(BINARY), "ask", title, message, *buttons],
-        capture_output=True, text=True,
+        # encoding pinned: the binary always writes UTF-8, but text=True alone
+        # decodes with the *locale* encoding, which one exotic LANG could skew.
+        # Deliberately NO errors="replace" — mojibake would silently alter an
+        # answer, while a decode failure raises into the hook path's broad
+        # except: no decision, terminal asks. Fail-open beats silent mangling.
+        capture_output=True, text=True, encoding="utf-8",
         env=_toast_env(timeout, slot, corner, hotkeys, kind, project, footer,
-                       options=options, descs=descriptions),
+                       options=options, descs=descriptions, other=other),
     )
+    # .strip() is a DECLARED canonicalization of the one load-bearing stdout
+    # path (rc == RC_OTHER): the framing "\n" must go, outer whitespace is
+    # non-semantic (whitespace-only ⇒ no answer), and interior bytes survive
+    # exactly. The permission-prompt call sites depend on this same contract.
     return proc.returncode, proc.stdout.strip()
 
 
@@ -554,9 +598,10 @@ def render_question(tinput: dict) -> dict:
     item and answers the whole set. Answers are all-or-nothing (a partial
     `answers` dict would mark the omitted questions as answered too), so if
     ANY question is richer than a card can faithfully represent (multiSelect,
-    5+ options — and the terminal UI also owns free-text "Other"), the whole
-    call becomes a non-blocking 'notice' instead: never a partially-answered
-    set."""
+    5+ options), the whole call becomes a non-blocking 'notice' instead: never
+    a partially-answered set. Free-text "Other" is card-native (the binary's
+    Other row, rc == RC_OTHER; see prompt_question) and is PURE UI — it never
+    adds an option here, changes NOTI_OPTIONS arity, or affects eligibility."""
     raw = tinput.get("questions")
     raw = raw if isinstance(raw, list) else []
     qs = [q for q in raw if isinstance(q, dict)]
@@ -868,8 +913,11 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
     appears. ALL-or-nothing: `answers` marks the whole call answered (partial-
     dict behavior is undocumented), so Esc / timeout / any error on ANY card
     discards everything collected so far and emits NO decision — the terminal
-    UI asks the full set fresh, with the full descriptions and free-text
-    "Other" it alone owns. The set shares ONE deadline (ask_timeout_seconds
+    UI asks the full set fresh (it alone owns the multiSelect / 5+ option /
+    duplicate-question shapes). Free-text "Other" is card-native when
+    approval.question_other is on: the binary's Other row submits typed text
+    as rc == RC_OTHER with the answer on stdout — the one place stdout is the
+    answer. The set shares ONE deadline (ask_timeout_seconds
     total; each card's drain shows what's actually left) because the installed
     hook timeout (ask_timeout + 30, sized for a single card) blocks the tool
     call outright when exceeded — per-card budgets would blow through it."""
@@ -881,6 +929,7 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
     # still shows the first card briefly instead of silently skipping straight
     # to the terminal with no visual signal at all
     deadline = time.monotonic() + max(float(cfg["toast"]["ask_timeout_seconds"]), 4.0)
+    allow_other = bool(cfg["approval"].get("question_other", True))
     answers = {}
     slot = acquire_slot()
     try:
@@ -891,18 +940,38 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
             project = d.get("project", "")
             if n > 1:
                 project = f"{project} · {i + 1} of {n}" if project else f"{i + 1} of {n}"
-            rc, _ = toast_ask(item["title"], item["message"], item["buttons"],
-                              remaining, cfg["toast"]["corner"], slot,
-                              hotkeys=bool(cfg["toast"].get("hotkeys", True)),
-                              kind="question", project=project,
-                              # full labels + descriptions ride in env for the
-                              # list layout; the footer advertises the terminal
-                              # escape hatch
-                              options=item["options"], descriptions=item["descriptions"],
-                              footer="esc · answer in terminal")
-            if not (0 <= rc < len(item["options"])):
-                return 0
-            answers[item["question"]] = item["options"][rc]
+            rc, typed = toast_ask(item["title"], item["message"], item["buttons"],
+                                  remaining, cfg["toast"]["corner"], slot,
+                                  hotkeys=bool(cfg["toast"].get("hotkeys", True)),
+                                  kind="question", project=project,
+                                  # full labels + descriptions ride in env for
+                                  # the list layout; the footer advertises the
+                                  # terminal escape hatch
+                                  options=item["options"], descriptions=item["descriptions"],
+                                  other=allow_other,
+                                  footer="esc · answer in terminal")
+            if 0 <= rc < len(item["options"]):
+                answers[item["question"]] = item["options"][rc]  # index -> EXACT raw label
+            elif rc == RC_OTHER and allow_other:
+                # The ONE place stdout is the answer. allow_other re-check is
+                # load-bearing: with the kill-switch off (or a stray NOTI_OTHER
+                # export / hostile binary) the row was never offered, so rc=10
+                # must stay in the junk bucket below. Strip C0 controls first —
+                # a single-line field can't TYPE them, they only arrive by
+                # paste — then outer whitespace. Whitespace-only is NOT an
+                # answer: spike-observed (Claude Code 2.1.198), an empty
+                # answers value doesn't error upstream, it silently marks the
+                # question unanswered and the terminal never re-asks — the
+                # question would be LOST. Emitting nothing hands the whole set
+                # back to the terminal picker instead.
+                typed = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", typed).strip()
+                if not typed:
+                    return 0
+                # never trunc()/_display_line() here: display helpers must not
+                # touch an answer
+                answers[item["question"]] = typed
+            else:
+                return 0    # esc / timeout / junk rc / sentinel-without-opt-in
             if i < n - 1:
                 # the card's own atexit deleted the slot file; re-claim the
                 # slot before the next card spawns, or a concurrent session

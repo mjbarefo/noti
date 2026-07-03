@@ -21,9 +21,11 @@ surfaces only the moments a human is actually needed:
    terminal picker never appears). A call carrying several questions shows one
    card per question in turn (`noti · 2 of 3` in the eyebrow), all sharing one
    deadline; answers are all-or-nothing, so Esc or timeout on any card sends
-   the **whole set** to the terminal, fresh. Multi-select sets get a
-   non-blocking heads-up toast instead — the terminal UI (full descriptions,
-   free-text "Other") owns those. When a
+   the **whole set** to the terminal, fresh. Each card also carries a ghost
+   **"Other…"** row — click it (or press the next digit) and the row becomes an
+   inline text field: type a custom answer, **Return** submits it exactly as
+   typed, **Esc** backs out to the list with the draft kept. Multi-select sets
+   get a non-blocking heads-up toast instead — the terminal UI owns those. When a
    plan is ready (`ExitPlanMode`), the toast shows a preview with
    **Approve / View**: Approve accepts the plan (implementation still goes
    through approval toasts); View, Esc, or timeout hands you the full plan UI
@@ -79,7 +81,8 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
                                                                     ├ No ───▶ deny
                                                                     └ (timeout) ▶ ask  (fall back to
                                                                                  Claude's terminal prompt)
-                 AskUserQuestion ─▶ numbered option list, one card per question
+                 AskUserQuestion ─▶ numbered option list + free-text "Other…" row,
+                                    one card per question
                                     ─▶ all answers via updatedInput (all-or-nothing;
                                     multi-select: heads-up toast, answer in terminal)
                  ExitPlanMode ────▶ Approve ─▶ allow  ·  View/timeout ─▶ terminal plan UI
@@ -154,6 +157,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `approval.governed_tools` | Bash, Edit, Write, MultiEdit, NotebookEdit, WebFetch | which tools can toast |
 | `approval.govern_mcp` | `true` | route MCP tool calls through noti |
 | `approval.surface_questions` | `true` | toast `AskUserQuestion` (simple ones answerable from the toast) |
+| `approval.question_other` | `true` | free-text "Other…" row on question cards (kill-switch: `false` hides the row **and** rejects its exit code) |
 | `approval.surface_plans` | `true` | toast `ExitPlanMode` with Approve / View |
 | `approval.mcp_autoallow_servers` | `[]` | servers whose read-only calls auto-allow; empty = every MCP call prompts |
 | `approval.bash_safe_commands` | ls, git status, grep, … | auto-allowed read-only verbs (no exec/write/delete flags, no shell metacharacters) |
@@ -209,8 +213,32 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   upstream, so if any card in the set is dismissed, everything collected is
   discarded and the terminal asks the full set fresh — noti never submits a
   half-answered call. Anything the toast can't represent faithfully
-  (multi-select, 5+ options, free-text "Other") is never answered from the
-  toast at all.
+  (multi-select, 5+ options, duplicate question texts) is never answered from
+  the toast at all.
+- A free-text **"Other…"** answer reaches Claude **exactly as typed**. The only
+  transformations on the wire: outer whitespace is stripped (a whitespace-only
+  submission is not an answer — Return is inert on an empty field, and the
+  Python side independently refuses one, because upstream would silently mark
+  the question unanswered rather than re-ask), and C0 control characters are
+  stripped — those can only arrive by paste into the single-line field. The
+  typed answer never passes through the display-copy helpers, is never
+  truncated at submit (the field caps input at 2000 chars *visibly*, while
+  typing), and rides its own dedicated exit code: any other exit code with text
+  on stdout is discarded, so a crashing binary's diagnostics can never become
+  your answer. Non-label answers use the same observed `updatedInput` contract
+  as option clicks; if a future Claude Code rejects them, set
+  `approval.question_other: false` — that both hides the row and makes the
+  Python side reject its exit code.
+- **While you type in the Other field, the keyboard stays pinned to the card.**
+  Mouse-leave does not disarm mid-edit (a drift that silently redirected the
+  rest of your sentence into the live terminal would be the exact accidental-
+  input class noti exists to prevent) — the terracotta border stays on while
+  the card has your keyboard, and Esc always backs out one level. Clicking
+  another app or Cmd-Tab ends the edit within a frame (draft kept, border
+  dropped): the border never lies about who has the keyboard. Editing keys run
+  through the field's own delegate (IME-safe: composing CJK text, the first
+  Return commits the composition, only the second submits), and Cmd+V/C/X/A
+  work even though the toast has no menu bar.
 - **Hotkeys are hover-armed.** The toast only captures the keyboard after the
   mouse *moves* over it, and releases it the moment the mouse leaves. A toast
   appearing while you type — even directly under a parked cursor — can never

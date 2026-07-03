@@ -7,6 +7,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Free-text "Other" on question cards** — the one AskUserQuestion capability
+  the terminal still owned for simple questions. Every option-list card now
+  ends in a ghost "Other…" row (hairline border, no fill: an escape hatch, not
+  a fifth answer). Click it or press the next digit and the row morphs in place
+  into a single-line editor — options dim but stay clickable (mouse rescue),
+  the keycap becomes ↩, the footer flips to `return · submit  esc · back`, and
+  the card's terracotta border says the keyboard lives there. Return submits
+  the text **exactly as typed** (dedicated exit code 10 / `RC_OTHER`; stdout
+  carries the answer; outer-whitespace strip and paste-only C0-control strip
+  are the only canonicalizations; empty submissions are impossible on both
+  sides of the wire). Esc backs out one level with the draft preserved as the
+  row label; clicking away or Cmd-Tab ends the edit within a frame so the
+  armed border never lies about keyboard focus; mouse-leave while typing
+  deliberately does *not* disarm (a mid-word disarm would leak the rest of the
+  answer into the live terminal). IME-safe by construction: editing keys run
+  through the field delegate's command selectors, never raw keycodes, so a
+  CJK composition's first Return commits the composition, not the card.
+  Kill-switch `approval.question_other: false` hides the row *and* rejects a
+  rogue exit-10 (the upstream non-label `updatedInput` contract is
+  spike-verified observed behavior, not documented API). Version-skew safe in
+  all four quadrants: an old binary ignores the flag (Esc → terminal keeps
+  owning Other); an old Python drops exit-10 in its junk bucket (no decision →
+  terminal). The row is pure UI — the decision dict, `NOTI_OPTIONS` arity, and
+  card eligibility are byte-identical to v0.5.
 - **Multi-question calls now toast** (33% of real usage; previously always a
   heads-up notice). A call carrying 2–4 simple questions shows one option-list
   card per question in sequence, with a `2 of 3` progress eyebrow. Answers are

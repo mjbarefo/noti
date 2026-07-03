@@ -338,17 +338,18 @@ q4 = {"questions": [{"question": "Pick one?",
 d7 = m.evaluate({"tool_name": "AskUserQuestion", "tool_input": q4,
                  "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
 _save_ask = m.toast_ask
-def _run_prompt(rc):
+def _run_prompt(rc, text="", use_cfg=cfg):
     calls = []
     def fake(title, message, buttons, timeout, corner, slot, **k):
-        calls.append({"timeout": timeout, "project": k.get("project", "")})
-        return (rc, "")
+        calls.append({"timeout": timeout, "project": k.get("project", ""),
+                      "other": k.get("other", None)})
+        return (rc, text)
     m.toast_ask = fake
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
             m.prompt_question({"tool_name": "AskUserQuestion", "tool_input": q4,
-                               "session_id": "t", "cwd": sys.argv[1]}, cfg, dict(d7))
+                               "session_id": "t", "cwd": sys.argv[1]}, use_cfg, dict(d7))
     finally:
         m.toast_ask = _save_ask
     return buf.getvalue(), calls
@@ -384,12 +385,14 @@ want("multi-question call toasts with one item per question",
 # hooks at) fails the exact-sequence assertion below
 _real_mono = m.time.monotonic
 def _run_multi(rcs, use_cfg=cfg, advance=10.0):
-    seq = list(rcs); calls = []
+    # entries are (rc, stdout_text) pairs; a bare int means stdout ""
+    seq = [(r, "") if isinstance(r, int) else r for r in rcs]; calls = []
     clock = {"t": 1000.0}
     def fake(title, message, buttons, timeout, corner, slot, **k):
-        calls.append({"timeout": timeout, "project": k.get("project", "")})
+        calls.append({"timeout": timeout, "project": k.get("project", ""),
+                      "other": k.get("other", None)})
         clock["t"] += advance
-        return (seq.pop(0), "")
+        return seq.pop(0)
     m.toast_ask = fake
     m.time.monotonic = lambda: clock["t"]
     buf = io.StringIO()
@@ -430,6 +433,95 @@ qdup = {"questions": [
 want("duplicate question texts -> notice",
      m.evaluate({"tool_name": "AskUserQuestion", "tool_input": qdup,
                  "permission_mode": "default", "cwd": sys.argv[1]}, cfg)["action"] == "notice")
+
+# v0.6: free-text "Other" on question cards. rc == RC_OTHER (a FIXED sentinel,
+# never len(options)) is the one path where stdout is the answer, guarded by
+# the question_other kill-switch, an emptiness check (spike-pinned: an empty
+# updatedInput answer is silently swallowed upstream — the terminal never
+# re-asks), and a C0 control strip. The row is PURE UI: the decision dict and
+# NOTI_OPTIONS arity are byte-identical to v0.5.
+want("RC_OTHER clear of the code space",
+     m.RC_OTHER > 4 and m.RC_OTHER not in (64, 70, 124))
+
+envo = m._toast_env(5, None, "top-right", options=["a", "b"], other=True)
+want("other=True sets NOTI_OTHER=1", envo.get("NOTI_OTHER") == "1")
+want("other=False -> NOTI_OTHER absent",
+     "NOTI_OTHER" not in m._toast_env(5, None, "top-right", options=["a", "b"]))
+want("other without options -> NOTI_OTHER absent",
+     "NOTI_OTHER" not in m._toast_env(5, None, "top-right", other=True))
+os.environ["NOTI_OTHER"] = "1"
+try:
+    want("inherited NOTI_OTHER scrubbed",
+         "NOTI_OTHER" not in m._toast_env(5, None, "top-right"))
+finally:
+    del os.environ["NOTI_OTHER"]
+
+def _answers(out):
+    return json.loads(out)["hookSpecificOutput"]["updatedInput"]["answers"]
+
+# single-question card: the full (rc, stdout) resolution matrix
+out_o, calls_o = _run_prompt(m.RC_OTHER, "some free text")
+want("free text -> exact string in answers",
+     _answers(out_o) == {"Pick one?": "some free text"})
+want("card offered the row (other=True observed)", calls_o[0]["other"] is True)
+want("empty free answer -> no decision",
+     _run_prompt(m.RC_OTHER, "")[0].strip() == "")
+want("whitespace-only free answer -> no decision",
+     _run_prompt(m.RC_OTHER, "   ")[0].strip() == "")
+want("outer whitespace stripped, interior exact",
+     _answers(_run_prompt(m.RC_OTHER, "  spaced  ")[0]) == {"Pick one?": "spaced"})
+want("unicode survives byte-exact",
+     _answers(_run_prompt(m.RC_OTHER, "café ☕")[0]) == {"Pick one?": "café ☕"})
+want("C0 controls stripped from a pasted answer",
+     _answers(_run_prompt(m.RC_OTHER, "a\x1b[31mb\x00c")[0]) == {"Pick one?": "a[31mbc"})
+# display helpers must never touch an answer: a tab, a run of spaces, and
+# >120 chars all survive byte-exact (kills the trunc()/_display_line()-on-
+# typed mutants, which are no-ops on short single-spaced fixtures)
+long_raw = "a\tb  c" + "x" * 300
+want("long/tabbed answer survives byte-exact",
+     _answers(_run_prompt(m.RC_OTHER, long_raw)[0]) == {"Pick one?": long_raw})
+# kills any "outside-range-but-has-stdout" heuristic: stdout is ONLY an
+# answer at rc == RC_OTHER — below it (7), and ABOVE it too (124/64 with a
+# dirty stdout: a binary that printed a diagnostic before dying must never
+# have that diagnostic submitted as the user's answer; kills rc >= RC_OTHER)
+want("junk rc with stdout -> no decision", _run_prompt(7, "ghost")[0].strip() == "")
+want("rc=124 with dirty stdout -> no decision",
+     _run_prompt(124, "ghost")[0].strip() == "")
+want("rc=64 with dirty stdout -> no decision",
+     _run_prompt(64, "usage: noti-toast ask|summary ...")[0].strip() == "")
+# display copy must never be the answer on the index path
+want("option rc answers from the LIST, never stdout",
+     _answers(_run_prompt(0, "Mangled Display Label")[0]) == {"Pick one?": "Alpha"})
+# the kill-switch pins BOTH sides: rc=10 stays junk AND the row is never offered
+offo = copy.deepcopy(cfg); offo["approval"]["question_other"] = False
+out_off, calls_off = _run_prompt(m.RC_OTHER, "rogue text", use_cfg=offo)
+want("question_other=False rejects rc=10", out_off.strip() == "")
+want("question_other=False never offers the row", calls_off[0]["other"] is False)
+
+# multi-question: free-text cards join the all-or-nothing set
+out_mo, calls_mo = _run_multi([(1, ""), (m.RC_OTHER, "my custom take"), (0, "")])
+want("mixed option/free-text set completes exactly",
+     _answers(out_mo) == {"Q-one?": "B1", "Q-two?": "my custom take", "Q-three?": "A3"})
+# typing earns no fresh budget: the shared deadline shrinks through a
+# free-text card exactly as through option cards (the hook timeout ask+30
+# still hard-blocks the tool call — see the v0.5.x block above)
+want("free-text card still shares ONE shrinking deadline",
+     [c["timeout"] for c in calls_mo] == [_ask, _ask - 10.0, _ask - 20.0])
+out_bail, calls_bail = _run_multi([(m.RC_OTHER, "typed then bailed"), (124, "")])
+want("esc after a free-text answer discards the set",
+     out_bail.strip() == "" and len(calls_bail) == 2)
+out_em, calls_em = _run_multi([(m.RC_OTHER, ""), (0, ""), (0, "")])
+want("empty free answer aborts the set at once",
+     out_em.strip() == "" and len(calls_em) == 1)
+
+# the Other row is PURE UI: policy output for the 4-option fixture is
+# byte-identical to v0.5 — no synthetic 5th option anywhere
+want("no synthetic Other in the decision dict",
+     len(d7["items"][0]["options"]) == 4
+     and d7["items"][0]["options"][3] == "Delta (Recommended)")
+want("no synthetic Other in NOTI_OPTIONS arity",
+     len(m._toast_env(5, None, "top-right", options=d7["items"][0]["options"],
+                      other=True)["NOTI_OPTIONS"].split("\x1f")) == 4)
 
 # v0.4: evaluate() is TOTAL against malformed / forward-incompatible payloads.
 # Claude Code's hook JSON has shifted across versions and a stranger may run an
@@ -472,5 +564,18 @@ PY
 sec=$?
 
 echo
-echo "summary: $pass passed, $fail failed (round-trip $([ $rt -eq 0 ] && echo ok || echo FAIL); security $([ $sec -eq 0 ] && echo ok || echo FAIL))"
-[ $fail -eq 0 ] && [ $rt -eq 0 ] && [ $sec -eq 0 ]
+echo "wire drift tripwire (free-text Other: exit code pinned in BOTH languages)"
+# RC_OTHER=10 is hardcoded at the Swift submit site and named in Python; if
+# either side drifts (renamed, revalued, or the submit site vanishes), the
+# sentinel silently stops round-tripping — fail loudly instead.
+wire=0
+if grep -qE 'exit\(10\)' bin/noti-toast.swift && grep -qE 'RC_OTHER = 10' noti; then
+  echo "  ok   Swift exit(10) <-> Python RC_OTHER = 10"
+else
+  echo "  FAIL RC_OTHER drift — Swift 'exit(10)' and Python 'RC_OTHER = 10' must BOTH exist"
+  wire=1
+fi
+
+echo
+echo "summary: $pass passed, $fail failed (round-trip $([ $rt -eq 0 ] && echo ok || echo FAIL); security $([ $sec -eq 0 ] && echo ok || echo FAIL); wire $([ $wire -eq 0 ] && echo ok || echo FAIL))"
+[ $fail -eq 0 ] && [ $rt -eq 0 ] && [ $sec -eq 0 ] && [ $wire -eq 0 ]

@@ -6,7 +6,8 @@
 //       Blocks until a button is clicked. Prints the clicked button's label to
 //       stdout and exits with that button's index (0, 1, 2, ...). If it times
 //       out (NOTI_TIMEOUT) before a click, or Esc is pressed while armed, it
-//       prints nothing and exits 124.
+//       prints nothing and exits 124. With NOTI_OTHER=1 (list mode only) the
+//       free-text row can submit instead: stdout = the typed answer, exit 10.
 //
 //   noti-toast summary "Title" "Body text\nsecond line"
 //       Shows a non-blocking card that auto-dismisses after NOTI_TIMEOUT
@@ -38,6 +39,16 @@
 //   NOTI_DESCS    per-option descriptions, \u{1f}-joined, same arity as
 //                 NOTI_OPTIONS. An arity mismatch drops ALL descriptions — a
 //                 description under the wrong option is worse than none.
+//   NOTI_OTHER    "1" appends the free-text "Other…" row to a list-mode card
+//                 (ignored without NOTI_OPTIONS — a permission prompt must
+//                 never grow a text field). Click or digit N+1 swaps the row
+//                 label for an inline single-line editor; Return submits:
+//                 stdout = the typed answer, exit 10 (keep in sync with
+//                 RC_OTHER in `noti`). Esc backs out one level, draft kept;
+//                 the row is fixed-height so the card NEVER reflows.
+//   NOTI_STATE    "other" auto-opens the Other editor ~0.1s after present —
+//                 snapshot/design aid (pairs with NOTI_SNAPSHOT and the
+//                 preview-toasts skill), works in both palettes.
 //   NOTI_APPEARANCE  light | dark — force a palette (snapshot/design review
 //                 aid; live toasts follow the system)
 //
@@ -232,7 +243,9 @@ final class KeyablePanel: NSPanel {
 final class HoverEffectView: NSVisualEffectView {
     var onArm: (() -> Void)?
     var onLeave: (() -> Void)?
-    private var inside = false
+    // read by endEditing() to decide between staying armed (mouse still on
+    // the card) and running the full leave routine (keyboard goes home)
+    private(set) var inside = false
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: bounds,
@@ -633,6 +646,188 @@ final class OptionRow: NSControl, Choice {
 }
 
 // ----------------------------------------------------------------------------
+// OtherRow — the free-text escape hatch on a question card (NOTI_OTHER=1).
+// GHOST register on purpose: no fill, hairline border — an escape hatch, not
+// a fifth answer (options are semantic peers; this row is a different kind of
+// thing and must read as one). FIXED 30pt height: the label swaps for the
+// editor IN PLACE and long text scrolls in a single line, so the card never
+// reflows and the published slot height stays truthful with zero work.
+// `tag` is the display ordinal ONLY — fire() opens the editor; it must NEVER
+// route through Handler.tap, whose stdout+exit(tag) contract would fabricate
+// an option answer out of a UI affordance.
+// ----------------------------------------------------------------------------
+
+final class OtherRow: NSControl, Choice {
+    let label = "Other…"
+    let key: String                    // digit N+1 — the list ordinal continues
+    var onFire: (() -> Void)?          // wired to beginEditing() by the ask case
+    private(set) var active = false    // editor visible (editing state)
+    let field: NSTextField             // pre-built, hidden until first edit
+    private let rowLabel: NSTextField
+    private var capBox: NSView!
+    private var capLabel: NSTextField!
+    static let height: CGFloat = 30    // the single-line minimum
+    private var hoverFill: NSColor { NSColor.labelColor.withAlphaComponent(0.14) }
+    private var ghostBorder: CGColor { NSColor.labelColor.withAlphaComponent(0.12).cgColor }
+
+    init(key: String, tag: Int, width: CGFloat) {
+        self.key = key
+        let textW = width - OptionRow.textX - 10
+        let lineH = measure("Mg", font: OptionRow.labelFont, width: textW, maxLines: 1).height
+        // single-line editor: no wrap, long text scrolls horizontally —
+        // what you see is what you send, and the height stays constant. No
+        // focus ring: the terracotta row hairline is the capture signal.
+        field = NSTextField(frame: NSRect(x: OptionRow.textX,
+                                          y: (OtherRow.height - lineH - 4) / 2,
+                                          width: textW, height: lineH + 4))
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.font = OptionRow.labelFont
+        field.placeholderString = "Type your answer…"
+        field.isHidden = true
+        rowLabel = NSTextField(labelWithString: "Other…")
+        rowLabel.font = OptionRow.labelFont
+        rowLabel.textColor = .secondaryLabelColor
+        rowLabel.lineBreakMode = .byTruncatingTail
+        rowLabel.frame = NSRect(x: OptionRow.textX, y: (OtherRow.height - lineH) / 2,
+                                width: textW, height: lineH)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: OtherRow.height))
+        self.tag = tag
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
+        layer?.borderWidth = 1
+        layer?.borderColor = ghostBorder
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Other: type your own answer")
+
+        // keycap: same geometry as OptionRow's, centered on the fixed row
+        let cap = NSView(frame: NSRect(x: 10, y: (OtherRow.height - OptionRow.capSize) / 2,
+                                       width: OptionRow.capSize, height: OptionRow.capSize))
+        cap.wantsLayer = true
+        cap.layer?.cornerRadius = 5
+        cap.layer?.cornerCurve = .continuous
+        cap.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.10).cgColor
+        let k = NSTextField(labelWithString: key)
+        k.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        k.textColor = .secondaryLabelColor
+        k.alignment = .center
+        k.frame = NSRect(x: 0, y: 2, width: OptionRow.capSize, height: 14)
+        cap.addSubview(k)
+        capBox = cap
+        capLabel = k
+        addSubview(cap)
+        addSubview(rowLabel)
+        addSubview(field)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // editing-state visuals: the terracotta hairline says "the keyboard lives
+    // HERE now"; the keycap becomes the submit hint
+    func beginEdit() {
+        active = true
+        layer?.backgroundColor = nil
+        rowLabel.isHidden = true
+        field.isHidden = false
+        layer?.borderColor = claude.cgColor
+        capLabel.stringValue = "↩"
+    }
+
+    func endEdit() {
+        active = false
+        // a non-empty draft becomes the row label — re-entry visibly resumes
+        let draft = field.stringValue
+        rowLabel.stringValue =
+            draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Other…" : draft
+        field.isHidden = true
+        rowLabel.isHidden = false
+        layer?.borderColor = ghostBorder
+        capLabel.stringValue = key
+    }
+
+    func setArmed(_ armed: Bool) {
+        capBox.layer?.backgroundColor =
+            NSColor.labelColor.withAlphaComponent(armed ? 0.20 : 0.10).cgColor
+    }
+
+    func fire() { onFire?() }          // NEVER Handler.tap — see class comment
+
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways],
+                                       owner: self, userInfo: nil))
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) {
+        if !active { layer?.backgroundColor = hoverFill.cgColor }
+    }
+    override func mouseExited(with event: NSEvent) {
+        if !active { layer?.backgroundColor = nil }
+    }
+    override func mouseDown(with event: NSEvent) { if !active { alphaValue = 0.7 } }
+    override func mouseUp(with event: NSEvent) {
+        alphaValue = 1
+        guard !active else { return }  // while editing, clicks belong to the editor
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { fire() }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CommitDelegate — ALL editing key semantics via doCommandBy selectors, NEVER
+// raw keycodes: during CJK composition the input context consumes Return/Esc,
+// so only a real commit/cancel ever reaches this delegate — a keyCode check
+// in the event monitor would kill the card mid-composition. Treat any future
+// "simplification" back into keycodes as a regression.
+// ----------------------------------------------------------------------------
+
+final class CommitDelegate: NSObject, NSTextFieldDelegate {
+    var onCancel: (() -> Void)?
+
+    func control(_ control: NSControl, textView: NSTextView,
+                 doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.insertNewline(_:)) {
+            // single-line field: newlines only arrive by paste (if at all —
+            // belt-and-suspenders), normalize each line break to ONE space so
+            // what-you-see-is-what-you-send holds
+            let flat = control.stringValue
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\r", with: " ")
+            // Return is inert on empty/whitespace-only text — the wire
+            // invariant says the binary never exits 10 without an answer
+            // (heir of the Return-inert list rule: Return only submits text
+            // the user authored and can see)
+            if flat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            FileHandle.standardOutput.write(Data((flat + "\n").utf8))
+            exit(10)                   // keep in sync with RC_OTHER in `noti`
+        }
+        if sel == #selector(NSResponder.cancelOperation(_:)) {
+            onCancel?()                // back to list state, draft preserved
+            return true
+        }
+        // nothing to tab to — swallowing keeps focus from stranding
+        if sel == #selector(NSResponder.insertTab(_:))
+            || sel == #selector(NSResponder.insertBacktab(_:)) { return true }
+        return false
+    }
+
+    func controlTextDidChange(_ note: Notification) {
+        guard let f = note.object as? NSTextField else { return }
+        // never mutate mid-IME-composition: replacing stringValue would
+        // destroy the marked text
+        if let tv = f.currentEditor() as? NSTextView, tv.hasMarkedText() { return }
+        // input-time cap, visibly — NEVER truncate at submit (silent
+        // integrity break)
+        if f.stringValue.count > 2000 { f.stringValue = String(f.stringValue.prefix(2000)) }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Modes
 // ----------------------------------------------------------------------------
 
@@ -663,6 +858,10 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     }
     let optLabels = usFields(env["NOTI_OPTIONS"])
     let listMode = (2...4).contains(optLabels.count) && optLabels.allSatisfy { !$0.isEmpty }
+    // Free-text "Other": opt-in via NOTI_OTHER=1, list mode ONLY — a stray
+    // export must never bolt a text field onto a permission prompt. PURE UI:
+    // never an extra NOTI_OPTIONS field, never an extra exit-code index.
+    let allowOther = listMode && (env["NOTI_OTHER"] == "1")
     var optDescs = usFields(env["NOTI_DESCS"])
     if optDescs.count != optLabels.count {
         // never guess pairings: a description under the wrong option is an
@@ -676,7 +875,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     // (and drawn even with hotkeys off: the numeral is the list's ordinal)
     var seen = Set<String>()
     let keys: [String] = listMode
-        ? (1...optLabels.count).map(String.init)
+        ? (1...(optLabels.count + (allowOther ? 1 : 0))).map(String.init)
         : buttons.map {
             let k = String($0.lowercased().prefix(1))
             return (hotkeys && !k.isEmpty && seen.insert(k).inserted) ? k : ""
@@ -715,12 +914,21 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
                                            maxLines: listMode ? 4 : 5)
 
     let handler = Handler()
-    var rows: [OptionRow] = []
+    var rows: [NSControl & Choice] = []
+    var otherRow: OtherRow?
     if listMode {
         for (i, lab) in optLabels.enumerated() {
             rows.append(OptionRow(title: lab, desc: optDescs[i], key: keys[i], tag: i,
                                   width: textW, target: handler,
                                   action: #selector(Handler.tap(_:))))
+        }
+        if allowOther {
+            // joins rows/choices so layout, setArmed, and the digit-match
+            // loop treat it uniformly; only its fire() differs (opens the
+            // editor instead of routing to Handler.tap)
+            let o = OtherRow(key: keys[optLabels.count], tag: optLabels.count, width: textW)
+            otherRow = o
+            rows.append(o)
         }
     }
     let rowsH = rows.reduce(0) { $0 + $1.frame.height } + CGFloat(max(0, rows.count - 1)) * 6
@@ -755,6 +963,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     }
 
     var choices: [NSControl & Choice] = []
+    var footerLabel: NSTextField?      // swapped to the editing hint mid-edit
     if listMode {
         var yTop = (msgH > 0 ? headerBottom - 9 - msgH : headerBottom) - 12
         for r in rows {
@@ -765,9 +974,11 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         }
         if footerH > 0 {
             // yTop sits one 6pt gap below the last row; the footer wants 8pt
-            vev.addSubview(label(footer, font: footerFont, color: .tertiaryLabelColor,
-                                 frame: NSRect(x: pad, y: yTop + 6 - 8 - footerH,
-                                               width: textW, height: footerH)))
+            let fl = label(footer, font: footerFont, color: .tertiaryLabelColor,
+                           frame: NSRect(x: pad, y: yTop + 6 - 8 - footerH,
+                                         width: textW, height: footerH))
+            vev.addSubview(fl)
+            footerLabel = fl
         }
     } else {
         var x = W - pad
@@ -782,9 +993,96 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         }
     }
 
+    // ------------------------------------------------------------------
+    // Keyboard: hover-armed hotkeys + the Other editing mode. Editing IS
+    // keyboard capture — always visible as the terracotta border — and it
+    // PINS: onArm/onLeave are inert while editing, because a mouse drift
+    // that disarmed mid-word would redirect the rest of a typed answer into
+    // the live terminal (the exact keystroke-leak class noti exists to
+    // prevent, inverted). The hover-arm rationale still holds: arming
+    // prevents PASSIVE capture, and edit mode is unreachable passively —
+    // entry needs a click or an armed digit press, two deliberate acts.
+    // ------------------------------------------------------------------
+    var armed = false
+    var editing = false
+    let commit = CommitDelegate()
+
+    func disarmVisuals() {
+        vev.layer?.borderColor = hairline.cgColor
+        choices.forEach { $0.setArmed(false) }
+    }
+
+    func beginEditing() {
+        guard let o = otherRow, !editing else { return }
+        // strict order: a click on a non-activating panel does NOT make it
+        // key — makeKey FIRST (idempotent when hover-arming already did),
+        // THEN the first-responder swap
+        panel.makeKey()
+        o.beginEdit()
+        panel.makeFirstResponder(o.field)
+        (o.field.currentEditor() as? NSTextView)?.insertionPointColor = claude
+        editing = true
+        // capture must be visible even when arming never happened (hotkeys
+        // off / pure-click entry): editing forces the armed border on
+        vev.layer?.borderColor = claude.withAlphaComponent(0.9).cgColor
+        o.setArmed(true)
+        // options recede but STAY clickable — clicking one mid-edit is
+        // deliberate mouse rescue (it answers; the draft dies with the
+        // process, which is what a rescue means)
+        for r in rows where !(r is OtherRow) { r.alphaValue = 0.55; r.setArmed(false) }
+        footerLabel?.stringValue = "return · submit   esc · back"
+    }
+
+    // keyLost = the panel already resigned key (user clicked away/Cmd-Tab):
+    // restore list state WITHOUT touching key focus — never makeKey() or
+    // orderOut/orderFront from that path, the keyboard is already home
+    func endEditing(keyLost: Bool = false) {
+        guard let o = otherRow, editing else { return }
+        editing = false
+        panel.makeFirstResponder(nil)  // commit the field editor into the field
+        o.endEdit()
+        for r in rows where !(r is OtherRow) { r.alphaValue = 1 }
+        footerLabel?.stringValue = footer      // Python owns the list footer
+        if !keyLost && hotkeys && vev.inside {
+            // mouse still on the card: stay armed — the same capture contract
+            // as hover-arming, and a second Esc (armed list state) exits 124:
+            // consistent "Esc backs out one level"
+            armed = true
+            vev.layer?.borderColor = claude.withAlphaComponent(0.9).cgColor
+            choices.forEach { $0.setArmed(true) }
+        } else {
+            armed = false
+            disarmVisuals()
+            if !keyLost {
+                // today's full leave routine — the keyboard goes home the
+                // instant the mode ends
+                panel.orderOut(nil)
+                panel.orderFrontRegardless()
+            }
+        }
+    }
+
+    commit.onCancel = { endEditing() }
+    otherRow?.field.delegate = commit
+    otherRow?.onFire = { beginEditing() }
+
+    // Truthful-border guard: if the user clicks another app / Cmd-Tabs
+    // mid-edit, the field editor is dead and keystrokes go elsewhere — the
+    // UI must say so within a frame. (Also retires the latent stale-armed
+    // border on click-away that predates this feature.)
+    NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
+                                           object: panel, queue: .main) { _ in
+        if editing {
+            endEditing(keyLost: true)
+        } else if armed {
+            armed = false
+            disarmVisuals()
+        }
+    }
+
     if hotkeys {
-        var armed = false
         vev.onArm = {
+            guard !editing else { return }     // the pin: editing owns capture
             guard !armed else { return }
             armed = true
             panel.makeKey()
@@ -793,15 +1091,37 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             choices.forEach { $0.setArmed(true) }
         }
         vev.onLeave = {
+            guard !editing else { return }     // the pin, leave side
             armed = false
-            vev.layer?.borderColor = hairline.cgColor
-            choices.forEach { $0.setArmed(false) }
+            disarmVisuals()
             // orderOut + re-orderFront reliably hands key focus back to the
             // frontmost app; resignKey() alone leaves the keyboard in limbo
             panel.orderOut(nil)
             panel.orderFrontRegardless()
         }
+    }
+    if hotkeys || allowOther {
+        // with hotkeys off, arming never happens, so this monitor is a pure
+        // pass-through EXCEPT while editing — "NOTI_HOTKEYS=0 = no
+        // hover-armed hotkeys" holds while paste stays alive during explicit
+        // editing. Editing keys (Return/Esc/Tab) are deliberately NOT here:
+        // they live in CommitDelegate's doCommandBy selectors (IME safety —
+        // see that class comment).
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+            if editing {
+                // .accessory app has no Edit menu -> shim the edit key
+                // equivalents, routed down the KEY window's responder chain
+                // (= the field editor)
+                if ev.modifierFlags.contains(.command),
+                   let ch = ev.charactersIgnoringModifiers?.lowercased() {
+                    let map: [String: Selector] = ["v": #selector(NSText.paste(_:)),
+                                                   "c": #selector(NSText.copy(_:)),
+                                                   "x": #selector(NSText.cut(_:)),
+                                                   "a": #selector(NSText.selectAll(_:))]
+                    if let sel = map[ch] { NSApp.sendAction(sel, to: nil, from: nil); return nil }
+                }
+                return ev   // EVERYTHING else flows to the field editor / IME untouched
+            }
             guard armed else { return ev }
             if ev.keyCode == 53 { exit(124) }                            // esc = no answer
             if ev.keyCode == 36 {
@@ -845,9 +1165,16 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         a.isRemovedOnCompletion = false
         drain.add(a, forKey: "drain")
     }
+    // snapshot/design aid: NOTI_STATE=other opens the editor after present so
+    // the editing state can be captured headlessly (NOTI_SNAPSHOT fires at
+    // 0.5s, comfortably after)
+    if allowOther && env["NOTI_STATE"] == "other" {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { beginEditing() }
+    }
     present(panel)
     snapshotIfRequested(vev)
     _ = handler                                    // keep alive
+    _ = commit                                     // field.delegate is weak
     app.run()
 
 case "summary":   // noti-toast summary "Title" "Body\nlines"
