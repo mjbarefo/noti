@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-02
+
+The questions release: `AskUserQuestion` becomes a first-class toast. Options
+render as the terminal picker's own numbered list, multi-question calls walk
+through one card per question, and a free-text "Other…" row covers the answer
+that isn't on the list.
+
 ### Added
 - **Free-text "Other" on question cards** — the one AskUserQuestion capability
   the terminal still owned for simple questions. Every option-list card now
@@ -160,7 +167,8 @@ that diagnoses a stranger's most likely install problems.
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
-[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/mjbarefo/noti/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjbarefo/noti/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjbarefo/noti/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mjbarefo/noti/releases/tag/v0.2.0
