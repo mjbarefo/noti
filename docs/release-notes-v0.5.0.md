@@ -1,6 +1,6 @@
 # noti v0.5.0 — questions become first-class
 
-*Draft release notes. Not yet published.*
+*Published as [v0.5.0](https://github.com/mjbarefo/noti/releases/tag/v0.5.0) on 2026-07-02.*
 
 v0.5.0 is about the other half of the human-in-the-loop conversation. Approvals
 were already toasts; now `AskUserQuestion` is too — rendered the way the
