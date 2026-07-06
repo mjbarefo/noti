@@ -267,6 +267,12 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   (see safety notes), but it means there's no fully hands-off keyboard answer.
 - macOS only.
 
+## Roadmap
+
+Planned hook coverage and the feature backlog live in [DEV.md](DEV.md) — every
+Claude Code hook event has an adopt/skip verdict there, so a missing
+integration is a decision, not an oversight.
+
 ## License
 
 [MIT](LICENSE) © 2026 Jacob Barefoot.

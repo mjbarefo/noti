@@ -21,6 +21,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that moves shares one deceleration curve, so concurrent cards read as one
   surface. Reduce-motion keeps the fades and drops the slides.
 
+### Documentation
+- **DEV.md, the roadmap.** Every Claude Code hook event (29 as of the
+  2026-07-06 docs snapshot) now carries an explicit adopt/skip verdict with
+  its reason, so hook coverage is a set of decisions instead of a set of
+  gaps. Plus: the "what adopting a hook means" checklist, seven growth
+  invariants (one decider; Stop-family stays inert; one keyboard-capturing
+  surface; …), the prioritized non-hook backlog, and the rejected list.
+  README and CONTRIBUTING point to it.
+
 ## [0.5.0] — 2026-07-02
 
 The questions release: `AskUserQuestion` becomes a first-class toast. Options

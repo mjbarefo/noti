@@ -46,6 +46,8 @@ terminal prompt, but still). Therefore:
 ## Non-negotiable invariants
 
 These are enforced by `test.sh` and by review. Don't work around them.
+(Planning a *new* feature or hook? Start at [DEV.md](DEV.md) — the roadmap,
+its adoption checklist, and the growth invariants that layer on these.)
 
 - **Never block the session.** Every hook entry point exits 0 and emits no
   decision on any internal error. A noti bug must degrade to Claude's own
