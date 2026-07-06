@@ -196,6 +196,7 @@ these govern growth.
 
 | Priority | Item | Notes |
 |---|---|---|
+| shipped 2026-07-06 | Junk-proof "Always" rules | `make_rule` refuses multiline and >200-char commands — an exact rule for a heredoc can never match a future call, so the "grant" was pure clutter (observed: 150+ multiline entries across real settings files, one 7.7KB). The approval toast hides the Always button whenever minting would refuse, so the button never silently downgrades to a one-time Yes. |
 | P1 | Other-editor countdown pause | While the free-text editor is open, pause or extend the deadline drain (≤15s grace). Timing out mid-sentence is the accidental-loss class noti exists to prevent. Swift-side; interacts with the all-or-nothing question-set deadline. |
 | P1 | `noti ask --other` CLI flag | Expose the free-text row to the reusable primitive — the exit-10 / RC_OTHER contract already exists. One README line under "Reusable primitives". |
 | P2 | Denials in the tally | `tally_record` learns a `denied` count (recorded at decision time in `hook_pretooluse`); summary reads "· denied 1". Pairs with PostToolUseFailure's `failed`. |

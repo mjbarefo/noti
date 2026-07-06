@@ -21,6 +21,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that moves shares one deceleration curve, so concurrent cards read as one
   surface. Reduce-motion keeps the fades and drops the slides.
 
+### Fixed
+- **"Always" no longer mints junk rules.** Approving a heredoc/multiline or
+  >200-character command with Always used to write the entire script into
+  `permissions.allow` as an exact "rule" — one that could never match a future
+  call (nobody re-runs a 2KB script byte-identically), leaving settings files
+  bloated and unauditable. `make_rule` now refuses such commands (the same
+  posture as the trailing-`*` refusal), and the approval toast simply doesn't
+  offer the Always button when minting would refuse — a button that silently
+  does less than it says is a lie the UI no longer tells.
+
 ### Documentation
 - **DEV.md, the roadmap.** Every Claude Code hook event (29 as of the
   2026-07-06 docs snapshot) now carries an explicit adopt/skip verdict with

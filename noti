@@ -389,6 +389,15 @@ def make_rule(tool: str, tinput: dict, cfg: dict):
         if cfg["approval"]["bash_always_mode"] == "prefix":
             head = " ".join(cmd.split()[:2])
             return f"Bash({head}:*)"
+        if "\n" in cmd or "\r" in cmd or len(cmd) > 200:
+            # An exact rule for a heredoc or a page-long && chain can never
+            # match a future call — nobody re-runs a 2KB script byte-identically
+            # — so the "grant" would be pure clutter that makes the permissions
+            # file unauditable (observed: 150+ multiline entries, one 7.7KB).
+            # Refuse; same posture as the trailing-* refusal above. The prompt
+            # flow checks mintability BEFORE the toast and hides the Always
+            # button, so this None is never a silent downgrade.
+            return None
         return f"Bash({cmd})"  # exact: safe default, never broadens a verb
     if tool in EDIT_TOOLS:
         path = tinput.get("file_path") or tinput.get("notebook_path")
@@ -1044,10 +1053,18 @@ def hook_pretooluse(payload: dict) -> int:
             debug(f"notice toast failed: {e}")
         return 0
 
-    # action == "prompt": show the toast.
+    # action == "prompt": show the toast. Offer "Always" only when make_rule
+    # can actually mint a rule for this exact call: where minting refuses
+    # (trailing *, multiline/oversized commands), the button would LOOK like a
+    # standing grant while silently downgrading to a one-time Yes — a button
+    # that does less than it says is a lie. Dispatch below is by label, so a
+    # two-button card needs no exit-code remapping.
+    mintable = make_rule(payload.get("tool_name", ""),
+                         payload.get("tool_input", {}) or {}, cfg) is not None
     slot = acquire_slot()
     try:
-        rc, label = toast_ask(d["title"], d["message"], ["Yes", "Always", "No"],
+        rc, label = toast_ask(d["title"], d["message"],
+                              ["Yes", "Always", "No"] if mintable else ["Yes", "No"],
                               cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
                               hotkeys=bool(cfg["toast"].get("hotkeys", True)),
                               kind=d.get("kind", ""), project=d.get("project", ""))

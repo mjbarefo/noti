@@ -207,6 +207,15 @@ finally:
 # v0.2: Claude reads a trailing * as a prefix rule — never mint one from 'Always'
 want("no rule minted for trailing-*", m.make_rule("Bash", {"command": "rm -rf node_modules/*"}, cfg) is None)
 
+# Junk-rule refusal: an exact rule for a heredoc/multiline or oversized command
+# can never match a future call — minting one is pure settings clutter (and the
+# prompt flow hides the Always button off this same None)
+want("no rule minted for multiline", m.make_rule("Bash", {"command": "cd /tmp\npython3 - <<'PY'\nprint(1)\nPY"}, cfg) is None)
+want("no rule minted for CR",        m.make_rule("Bash", {"command": "echo a\rrm -rf /"}, cfg) is None)
+want("no rule minted over 200 chars", m.make_rule("Bash", {"command": "echo " + "x" * 200}, cfg) is None)
+want("200-char boundary still mints", m.make_rule("Bash", {"command": "e" + "x" * 199}, cfg) is not None)
+want("normal command still mints",   m.make_rule("Bash", {"command": "npm run build"}, cfg) == "Bash(npm run build)")
+
 # v0.2: Claude's documented pattern forms are recognized (fewer needless toasts)
 want("bash 'cmd *' prefix form",      m.pattern_matches("Bash", {"command":"npm run build"}, "Bash(npm run *)"))
 want("bash 'cmd *' word boundary", not m.pattern_matches("Bash", {"command":"npm runner"}, "Bash(npm run *)"))
