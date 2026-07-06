@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Toast motion, refined end to end.** Cards now arrive the way system
+  banners do — a fade plus a short slide in from the corner's screen edge —
+  and *every* exit animates: answering, Esc, timeout, click-to-dismiss, and
+  the summary fuse all leave through one `dismissThenExit()` fade (0.15s when
+  you acted, 0.3s when a card expires) instead of blinking off mid-glance.
+  The answer wire is untouched: stdout is written before the animation, a
+  `dismissing` latch makes double-fires impossible, and the keyboard hands
+  back to the terminal the instant an answer commits, not when the fade ends.
+  Stacked columns stop lurching on the 0.4s poll: each card kqueue-watches
+  the slot directory and the column settles ~0.1s after a neighbour's slot
+  file disappears (the timer stays as heartbeat and backstop). Everything
+  that moves shares one deceleration curve, so concurrent cards read as one
+  surface. Reduce-motion keeps the fades and drops the slides.
+
 ## [0.5.0] — 2026-07-02
 
 The questions release: `AskUserQuestion` becomes a first-class toast. Options

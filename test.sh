@@ -569,10 +569,10 @@ echo "wire drift tripwire (free-text Other: exit code pinned in BOTH languages)"
 # either side drifts (renamed, revalued, or the submit site vanishes), the
 # sentinel silently stops round-tripping — fail loudly instead.
 wire=0
-if grep -qE 'exit\(10\)' bin/noti-toast.swift && grep -qE 'RC_OTHER = 10' noti; then
-  echo "  ok   Swift exit(10) <-> Python RC_OTHER = 10"
+if grep -qE 'dismissThenExit\(code: 10,' bin/noti-toast.swift && grep -qE 'RC_OTHER = 10' noti; then
+  echo "  ok   Swift dismissThenExit(code: 10, ...) <-> Python RC_OTHER = 10"
 else
-  echo "  FAIL RC_OTHER drift — Swift 'exit(10)' and Python 'RC_OTHER = 10' must BOTH exist"
+  echo "  FAIL RC_OTHER drift — Swift 'dismissThenExit(code: 10, ...)' and Python 'RC_OTHER = 10' must BOTH exist"
   wire=1
 fi
 

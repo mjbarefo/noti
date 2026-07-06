@@ -21,8 +21,9 @@
 //                 don't overlap (slot 0 is the corner, 1 sits below it, ...)
 //   NOTI_SLOT_DIR directory of slot files (one per live toast). When set, the
 //                 toast publishes its height there, heartbeats it, and re-packs
-//                 the column each 0.4s — stacking below the REAL cards and
-//                 sliding up when a neighbour dismisses.
+//                 the column — within ~0.1s via a kqueue watch on the
+//                 directory, each 0.4s as a backstop — stacking below the REAL
+//                 cards and sliding up when a neighbour dismisses.
 //   NOTI_CORNER   top-right (default) | bottom-right | top-left | bottom-left
 //   NOTI_HOTKEYS  "0" disables hover-armed keyboard shortcuts (default on)
 //   NOTI_KIND     run | edit | fetch | mcp | tool | note | question | plan —
@@ -84,6 +85,13 @@
 //     typing in the terminal, can never swallow a keystroke — so an in-flight
 //     "y" can't accidentally approve anything. Arming is visible (accent border,
 //     keycaps brighten); moving the mouse off disarms and hands the keyboard back.
+//   * Motion: cards arrive from the corner's screen edge (the direction a
+//     system banner comes from) and EVERY exit — answer, Esc, timeout, click,
+//     auto-dismiss — leaves through dismissThenExit()'s fade: a card that
+//     blinks off mid-glance reads as a crash, not a completion. The stacked
+//     column re-packs the moment a neighbour's slot file disappears, and
+//     everything that moves shares one deceleration curve so concurrent cards
+//     read as one surface. Reduce-motion keeps the fades, drops the slides.
 //
 // Build: swiftc -O noti-toast.swift -o noti-toast   (zero third-party deps)
 
@@ -132,6 +140,8 @@ let slotIndex = max(0, Int(env["NOTI_SLOT"] ?? "0") ?? 0)
 let slotDir = env["NOTI_SLOT_DIR"]
 let slotGap: CGFloat = 10
 var slotFile: String?          // global: read by the capture-less atexit handler
+var slotWatcher: DispatchSourceFileSystemObject?   // keep-alive for the dir watch
+var repackPending = false      // leading-edge throttle for watcher-driven re-packs
 
 func stackOffset(myHeight: CGFloat) -> CGFloat {
     guard let dir = slotDir else {
@@ -233,6 +243,14 @@ let monoKinds: Set<String> = ["run", "edit", "fetch", "mcp", "tool"]
 
 let hairline = NSColor.separatorColor
 
+// The one deceleration curve for everything that moves — the entrance slide,
+// the column settling after a neighbour leaves. Fast start, long soft landing
+// (an ease-out-quint, roughly how system banners arrive); the stock .easeOut
+// stops too abruptly and reads mechanical next to real Notification Center
+// motion. One curve everywhere is what makes concurrent cards move like one
+// surface instead of a pile of independent windows.
+let settleCurve = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+
 // A borderless panel refuses key status by default; hotkeys need it. The panel
 // still never *activates* the app (.nonactivatingPanel), so Spaces/focus stay put.
 final class KeyablePanel: NSPanel {
@@ -296,10 +314,11 @@ func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
         try? "\(Int(height))".write(toFile: mine, atomically: true, encoding: .utf8)
         slotFile = mine
         atexit { if let p = slotFile { try? FileManager.default.removeItem(atPath: p) } }
-        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
-            // heartbeat: mtime is the liveness signal for the Python stale sweep
-            try? "\(Int(height))".write(toFile: mine, atomically: true, encoding: .utf8)
-            guard slotIndex > 0 else { return }            // the corner card never moves
+        let repack = { (duration: TimeInterval) in
+            // the corner card never moves; a dying card holds still while it
+            // fades — sliding a half-transparent card up the column reads as
+            // a glitch, and its slot is only truly free once it exits
+            guard slotIndex > 0, !dismissing else { return }
             let target = origin(in: vf, width: width, height: height,
                                 stack: stackOffset(myHeight: height))
             guard abs(target.y - panel.frame.origin.y) > 0.5 else { return }
@@ -307,10 +326,44 @@ func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
                 panel.setFrameOrigin(target)
             } else {
                 NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.25
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    ctx.duration = duration
+                    ctx.timingFunction = settleCurve
                     panel.animator().setFrameOrigin(target)
                 }
+            }
+        }
+        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
+            // heartbeat: mtime is the liveness signal for the Python stale
+            // sweep. Runs to the very end — the slot is owned until exit.
+            try? "\(Int(height))".write(toFile: mine, atomically: true, encoding: .utf8)
+            repack(0.3)                                    // backstop re-pack
+        }
+        if slotIndex > 0 {
+            // kqueue watch on the slot dir: a neighbour's exit deletes its
+            // slot file and the column settles ~0.1s later, not at whatever
+            // phase the 0.4s tick happens to be — the lurch after a dismissal
+            // was the single most visible seam in the stacking illusion.
+            // Leading-edge throttle, NOT cancel-and-reschedule debounce:
+            // sibling heartbeats write the dir every 0.4s, so a debounce that
+            // resets on every event could starve forever. The 0.1s pause also
+            // rides out delete-then-recreate blips (a multi-question flow
+            // re-claims its slot between cards) without a bounce. The fd is
+            // deliberately never closed — it lives exactly as long as the
+            // process. Failure at any step falls back to the 0.4s tick.
+            let fd = open(dir, O_EVTONLY)
+            if fd >= 0 {
+                let watcher = DispatchSource.makeFileSystemObjectSource(
+                    fileDescriptor: fd, eventMask: .write, queue: .main)
+                watcher.setEventHandler {
+                    guard !repackPending else { return }
+                    repackPending = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        repackPending = false
+                        repack(0.3)
+                    }
+                }
+                watcher.resume()
+                slotWatcher = watcher
             }
         }
     }
@@ -363,24 +416,76 @@ func timeoutSeconds(default def: Double) -> Double {
     return def
 }
 
-// Fade + a short settle toward the corner (slides down from a top corner, up
-// from a bottom one). Respects the system reduce-motion setting.
+// Banner entrance: fade + a short slide in from the corner's adjacent screen
+// edge — the direction a system banner arrives from, so the card reads as
+// "delivered to the corner", where the old vertical settle read as "dropped
+// on it". 24pt is enough to give the motion a direction without the card
+// visibly crossing content. Respects the system reduce-motion setting.
 func present(_ panel: NSPanel) {
     let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     let target = panel.frame
     if !reduce {
-        let fromTop = (env["NOTI_CORNER"] ?? "top-right").hasPrefix("top")
-        panel.setFrameOrigin(NSPoint(x: target.origin.x,
-                                     y: target.origin.y + (fromTop ? 8 : -8)))
+        let dx: CGFloat = (env["NOTI_CORNER"] ?? "top-right").hasSuffix("left") ? -24 : 24
+        panel.setFrameOrigin(NSPoint(x: target.origin.x + dx, y: target.origin.y))
     }
     panel.alphaValue = 0
     panel.orderFrontRegardless()
     NSAnimationContext.runAnimationGroup { ctx in
-        ctx.duration = reduce ? 0.12 : 0.22
-        ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ctx.duration = reduce ? 0.12 : 0.3
+        ctx.timingFunction = settleCurve
         panel.animator().alphaValue = 1
         if !reduce { panel.animator().setFrame(target, display: true) }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Animated exit — every exit the user can see goes through here. A card that
+// blinks off mid-glance reads as a crash, not a completion; the fade + short
+// slide toward the edge it arrived from says "handled". The answer contract
+// is untouched: stdout is written BEFORE the animation and the exit code
+// lands ~0.15s later — imperceptible next to the human who just clicked.
+// ----------------------------------------------------------------------------
+
+var activePanel: NSPanel?      // set by each mode right after makeCard
+var dismissing = false         // the first answer wins, forever
+
+// The `dismissing` latch plus ignoresMouseEvents make a double-fire during
+// the fade impossible (instant exit() used to get that for free); a dropped
+// second call drops its output too, so stdout can never carry two answers.
+// User-initiated exits are quick (0.15s — the user acted, get out of the
+// way); timeouts and auto-dismissals may pass a gentler duration (nobody is
+// waiting on those). Reduce-motion: short pure fade.
+func dismissThenExit(code: Int32, output: String? = nil, duration: TimeInterval = 0.15) {
+    guard !dismissing else { return }
+    dismissing = true
+    if let output { FileHandle.standardOutput.write(Data((output + "\n").utf8)) }
+    guard let panel = activePanel else { exit(code) }   // fail-open: no panel, no ceremony
+    // Mouse events keep landing ON the fading card (every handler is inert
+    // behind the latch) — ignoresMouseEvents would pass clicks THROUGH a
+    // still-visible card to whatever sits beneath it, which is worse.
+    if panel.isKeyWindow {
+        // the keyboard goes home the instant the answer commits, not when the
+        // fade ends — orderOut + re-orderFront is the proven handoff (see
+        // onLeave; resignKey alone leaves the keyboard in limbo). Deferred one
+        // turn: the Other-submit path reaches here from INSIDE the field
+        // editor's doCommandBy, and tearing down first-responder state
+        // re-entrantly from that stack is how AppKit crashes are made.
+        DispatchQueue.main.async {
+            panel.orderOut(nil)
+            panel.orderFrontRegardless()
+        }
+    }
+    let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    NSAnimationContext.runAnimationGroup({ ctx in
+        ctx.duration = reduce ? 0.1 : duration
+        ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        panel.animator().alphaValue = 0
+        if !reduce {
+            var f = panel.frame
+            f.origin.x += (env["NOTI_CORNER"] ?? "top-right").hasSuffix("left") ? -14 : 14
+            panel.animator().setFrame(f, display: true)
+        }
+    }, completionHandler: { exit(code) })
 }
 
 // Debug aid: NOTI_SNAPSHOT=/path.png renders the card's own view hierarchy to
@@ -389,6 +494,9 @@ func present(_ panel: NSPanel) {
 func snapshotIfRequested(_ vev: NSView) {
     guard let path = env["NOTI_SNAPSHOT"] else { return }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        // a committed answer's code must win: this exit(0) landing mid-fade
+        // would rewrite e.g. a clicked "No" (exit 2) into option 0's index
+        guard !dismissing else { return }
         if let rep = vev.bitmapImageRepForCachingDisplay(in: vev.bounds) {
             vev.cacheDisplay(in: vev.bounds, to: rep)
             if let png = rep.representation(using: .png, properties: [:]) {
@@ -417,11 +525,11 @@ protocol Choice: AnyObject {
 final class Handler: NSObject {
     @objc func tap(_ sender: Any?) {
         guard let b = sender as? (NSControl & Choice) else { exit(70) }
-        FileHandle.standardOutput.write(Data((b.label + "\n").utf8))
-        exit(Int32(b.tag))                     // exit code == option index
+        // stdout = label, exit code == option index — via the animated exit
+        dismissThenExit(code: Int32(b.tag), output: b.label)
     }
     @objc func dismiss(_ sender: Any?) {
-        exit(0)                                // summary: click anywhere to dismiss
+        dismissThenExit(code: 0)               // summary: click anywhere to dismiss
     }
 }
 
@@ -803,8 +911,8 @@ final class CommitDelegate: NSObject, NSTextFieldDelegate {
             // (heir of the Return-inert list rule: Return only submits text
             // the user authored and can see)
             if flat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
-            FileHandle.standardOutput.write(Data((flat + "\n").utf8))
-            exit(10)                   // keep in sync with RC_OTHER in `noti`
+            dismissThenExit(code: 10, output: flat)   // keep 10 in sync with RC_OTHER in `noti`
+            return true
         }
         if sel == #selector(NSResponder.cancelOperation(_:)) {
             onCancel?()                // back to list state, draft preserved
@@ -941,6 +1049,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     if footerH > 0 { H += 8 + footerH }
 
     let (panel, vev) = makeCard(width: W, height: H)
+    activePanel = panel
     let headerBottom = H - 14 - headerH
     vev.addSubview(chipView(x: pad, y: headerBottom + (headerH - chip) / 2, size: chip, kind: kind))
     if eyeH > 0 {
@@ -1013,7 +1122,11 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     }
 
     func beginEditing() {
-        guard let o = otherRow, !editing else { return }
+        // the one non-Handler re-entry path: a mouse-down held on the Other
+        // row while the timeout fires still gets its mouse-up (the window
+        // server latched it), and an unguarded beginEditing would makeKey()
+        // a card that has already answered 124 and is fading out
+        guard !dismissing, let o = otherRow, !editing else { return }
         // strict order: a click on a non-activating panel does NOT make it
         // key — makeKey FIRST (idempotent when hover-arming already did),
         // THEN the first-responder swap
@@ -1108,6 +1221,10 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         // they live in CommitDelegate's doCommandBy selectors (IME safety —
         // see that class comment).
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { ev in
+            // mid-fade the answer is already committed — swallow everything
+            // (the panel can still be key for ~0.15s, so keys landing here
+            // can't have been meant for the terminal)
+            if dismissing { return nil }
             if editing {
                 // .accessory app has no Edit menu -> shim the edit key
                 // equivalents, routed down the KEY window's responder chain
@@ -1123,7 +1240,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
                 return ev   // EVERYTHING else flows to the field editor / IME untouched
             }
             guard armed else { return ev }
-            if ev.keyCode == 53 { exit(124) }                            // esc = no answer
+            if ev.keyCode == 53 { dismissThenExit(code: 124); return nil }   // esc = no answer
             if ev.keyCode == 36 {
                 // Return approves (Yes / Approve) on the classic row. A
                 // question's options are peers: an invisible default is how
@@ -1146,8 +1263,11 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     let secs = timeoutSeconds(default: 120)   // safety net: never block forever if NOTI_TIMEOUT is unset
     if secs > 0 {
         Timer.scheduledTimer(withTimeInterval: secs, repeats: false) { _ in
+            guard !dismissing else { return }      // an in-flight answer wins
             FileHandle.standardError.write(Data("timeout\n".utf8))
-            exit(124)                              // distinct: "no answer"
+            // distinct: "no answer" — a touch slower than a click-exit; the
+            // card expired, nobody is waiting on it
+            dismissThenExit(code: 124, duration: 0.3)
         }
         // the deadline, made visible: a hairline that drains until the prompt
         // falls back to the terminal
@@ -1200,6 +1320,7 @@ case "summary":   // noti-toast summary "Title" "Body\nlines"
     if footerH > 0 { H += 6 + footerH }
 
     let (panel, vev) = makeCard(width: W, height: H)
+    activePanel = panel
     let rowBottom = H - 12 - rowH
     vev.addSubview(chipView(x: pad, y: rowBottom + (rowH - chip) / 2, size: chip, kind: kind))
     vev.addSubview(label(title, font: titleFont, color: .labelColor,
@@ -1230,10 +1351,7 @@ case "summary":   // noti-toast summary "Title" "Body\nlines"
     func scheduleDismiss(after t: TimeInterval) {
         fuse?.invalidate()
         fuse = Timer.scheduledTimer(withTimeInterval: t, repeats: false) { _ in
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.3
-                panel.animator().alphaValue = 0
-            }, completionHandler: { exit(0) })
+            dismissThenExit(code: 0, duration: 0.3)   // unhurried: nobody clicked
         }
     }
     let secs = timeoutSeconds(default: 6)
