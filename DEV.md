@@ -203,11 +203,78 @@ these govern growth.
 | P2 | Doctor: managed-settings warning | Promote the README known-limitation: if `/Library/Application Support/ClaudeCode/managed-settings.json` exists, warn that its deny rules are invisible to noti and suggest emptying `bash_safe_commands`. Read-only check, zero-dep. |
 | P2 | Doctor: hook-coverage drift | Compare installed event set against this version's shipped set; "install predates `<event>` — `noti uninstall && noti install`". R6's enforcement arm. |
 | P2 | Opt-in per-toast sound | Accessibility: `toast.sound` (default false). NSSound is AppKit — zero-dep holds. Distinct (or no) sound for summary vs ask, so ask stays salient. |
+| P2 | The pet — a standing summons | Opt-in ambient companion; big enough to earn its own section below. |
 | P3 | Document `--kind error` | Falls out of StopFailure; README only. |
+
+## The pet — a standing summons (design)
+
+Inspired by [Codex pets](https://developers.openai.com/codex/app/settings):
+a small floating companion that reflects agent status — and whose
+"waiting for your input" state is noti's entire reason to exist, rendered as
+presence instead of an event. A toast is a knock: miss it (away from the desk,
+other Space, other monitor) and nothing keeps asking. A pet holding up a
+"you're needed" sign **is the standing form of the summons** — it answers
+exactly one question at a glance: *does any session need me, and which?*
+
+**The charter tension, stated plainly:** the charter says "narration fails
+the test, always" — and a pet's calm *running* pose is presence-as-narration,
+full stop. Opt-in doesn't dissolve that; it only changes who is exposed to
+it. So shipping the pet requires **amending the charter itself** with one
+carve-out sentence: *an opt-in ambient surface may exist so the summons has
+somewhere to stand; everything it shows outside the summons stays inert —
+no counts, no progress, no lists.* If that sentence can't be written into
+the charter with a straight face at implementation time, the pet doesn't
+ship. It remains NOT the rejected dashboard: one critter, one question.
+
+Sketch (all of it gated on a `docs/spikes/` spike first):
+
+- **Surface**: a new `pet` mode of the toast binary — same `.accessory` /
+  non-activating / all-Spaces NSPanel DNA as the cards. Small (~64pt),
+  draggable, remembers its corner (re-clamped on
+  `didChangeScreenParametersNotification` — an undock must not park it
+  off-screen). Never the key window (R3), never emits anything (R1).
+  Suggested default character: a little terracotta crab — the identity color
+  already means "Claude wants me" from across the room.
+- **State feed**: the pet is a long-lived *reader*, never in any hook path.
+  Hooks drop per-session, event-stamped state files (`waiting` / `running` /
+  `done` / `failed`) into a state dir; the pet kqueue-watches it (the slot
+  re-pack pattern) and shows the most-urgent state. **No mtime heartbeat** —
+  unlike slot files, nothing lives to re-touch these between hooks, so a
+  10-minute build would go falsely stale. Instead: `waiting` expires on its
+  natural bound (`ask_timeout + 30`); `running` never expires (a stale
+  "running" from a killed session costs a calm pose, not a false summons);
+  `done`/`failed` decay to asleep. Known blind spot, documented on purpose:
+  no hook fires when a terminal prompt is *answered*, so `waiting` clears
+  only at the session's next PreToolUse/Stop — self-healing, but late. Hook
+  writes are best-effort: a failed write degrades to a wrong-mood pet, never
+  a blocked session.
+- **States**: *waiting on you* (animated, project name shown — the whole
+  point) · *running* (calm idle) · *done* (brief acknowledgment, then rest)
+  · *turn failed* (alarmed, pairs with StopFailure) · *no sessions* (asleep).
+  Every state keeps a distinct static pose so reduce-motion loses the
+  animation, never the meaning. Click shows noti's own mini card naming the
+  waiting session(s) — focusing the right terminal window is a spike
+  question (hook payloads carry only `cwd`, ambiguous across tabs and
+  unresolvable over ssh/tmux), not a promise.
+- **Personality without a pipeline**: frames are embedded sprite data
+  (zero-dep holds); `pet.sprite` may point at a user-supplied sprite-sheet
+  PNG — validated on load, silent fallback to the embedded default —
+  hatching-by-AI is out of scope, drawing your own is not.
+- **Lifecycle**: summoned/dismissed by `noti pet`, detached from its shell
+  (the `toast_summary` `start_new_session` pattern); killed by
+  `noti uninstall`; no launchd, so no reboot persistence — you re-summon it,
+  and that price is documented rather than papered over.
+- **Spike questions**: sprite frames vs CALayer vector poses; CPU/battery of
+  an always-on surface (animate only on state change?); one pet vs
+  per-session pets when several sessions wait at once (until resolved, the
+  click card may name more than one); whether any terminal-focus affordance
+  is feasible at all; whether the pet ever suppresses a toast (current
+  answer: never — different surface class, R5 satisfied by design).
 
 **Rejected**, with reasons, so they don't get re-litigated:
 
-- Session dashboard / multi-session overview — herdr's job.
+- Session dashboard / multi-session overview — herdr's job. (The pet above
+  is not this: one critter, one question, no lists.)
 - Linux/Windows port — AppKit *is* the zero-dependency bet.
 - Hands-off keyboard answers (no hover-arm) — the arming gesture is the
   keystroke-safety design, not friction to sand off.
