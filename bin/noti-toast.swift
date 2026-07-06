@@ -448,6 +448,13 @@ func present(_ panel: NSPanel) {
 
 var activePanel: NSPanel?      // set by each mode right after makeCard
 var dismissing = false         // the first answer wins, forever
+// noti's own belief about key status, maintained at the two makeKey() sites
+// and the didResignKey observer. Deliberately NOT panel.isKeyWindow: that
+// property is @MainActor-annotated in current SDKs and reading it from a
+// global (Sendable) function is a Swift 6 error — and the belief is the
+// truer test anyway ("did WE take the keyboard"), immune to a stray panel
+// becoming key by some path noti never armed.
+var panelHasKey = false
 
 // The `dismissing` latch plus ignoresMouseEvents make a double-fire during
 // the fade impossible (instant exit() used to get that for free); a dropped
@@ -463,7 +470,7 @@ func dismissThenExit(code: Int32, output: String? = nil, duration: TimeInterval 
     // Mouse events keep landing ON the fading card (every handler is inert
     // behind the latch) — ignoresMouseEvents would pass clicks THROUGH a
     // still-visible card to whatever sits beneath it, which is worse.
-    if panel.isKeyWindow {
+    if panelHasKey {
         // the keyboard goes home the instant the answer commits, not when the
         // fade ends — orderOut + re-orderFront is the proven handoff (see
         // onLeave; resignKey alone leaves the keyboard in limbo). Deferred one
@@ -1131,6 +1138,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         // key — makeKey FIRST (idempotent when hover-arming already did),
         // THEN the first-responder swap
         panel.makeKey()
+        panelHasKey = true
         o.beginEdit()
         panel.makeFirstResponder(o.field)
         (o.field.currentEditor() as? NSTextView)?.insertionPointColor = claude
@@ -1185,6 +1193,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     // border on click-away that predates this feature.)
     NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
                                            object: panel, queue: .main) { _ in
+        panelHasKey = false
         if editing {
             endEditing(keyLost: true)
         } else if armed {
@@ -1199,6 +1208,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             guard !armed else { return }
             armed = true
             panel.makeKey()
+            panelHasKey = true
             // arming must be visible — the user needs to know the keyboard is live
             vev.layer?.borderColor = claude.withAlphaComponent(0.9).cgColor
             choices.forEach { $0.setArmed(true) }
