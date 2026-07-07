@@ -359,6 +359,7 @@ def launch_pet(cfg: dict) -> int:
     env["NOTI_PET_STATE_DIR"] = str(pet_state_dir(cfg))
     env["NOTI_PET_WAITING_TTL"] = str(int(cfg["toast"]["ask_timeout_seconds"]) + 30)
     env["NOTI_PET_DONE_TTL"] = str((cfg.get("pet") or {}).get("done_decay_seconds", 6))
+    env["NOTI_PET_PID_FILE"] = str(PET_PID_FILE)
     env["NOTI_CORNER"] = cfg["toast"]["corner"]
     proc = subprocess.Popen(
         [str(BINARY), "pet"],

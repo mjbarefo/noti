@@ -841,6 +841,36 @@ try:
 finally:
     m.pet_is_running, m.launch_pet, m.load_config = _isrun, _launch, _lc2
 
+# launch_pet passes the pid-file path to the Swift pet so a UI-initiated close
+# can tidy the same pid file that --stop/uninstall consult.
+_pf, _bin, _popen, _sleep = m.PET_PID_FILE, m.BINARY, m.subprocess.Popen, m.time.sleep
+env_tmp = tempfile.mkdtemp()
+captured = {}
+class _FakePetProc:
+    pid = 7777
+    returncode = None
+    def poll(self):
+        return None
+def _fake_popen(argv, **kw):
+    captured["argv"] = argv
+    captured["env"] = kw.get("env")
+    return _FakePetProc()
+try:
+    m.PET_PID_FILE = pathlib.Path(env_tmp) / "pet.pid"
+    m.BINARY = pathlib.Path("/usr/bin/true")
+    m.subprocess.Popen = _fake_popen
+    m.time.sleep = lambda _secs: None
+    lp_cfg = copy.deepcopy(cfg)
+    lp_cfg["pet"]["state_dir"] = env_tmp
+    pid = m.launch_pet(lp_cfg)
+    want("launch_pet exports NOTI_PET_PID_FILE for UI close cleanup",
+         pid == 7777 and captured.get("argv") == [str(m.BINARY), "pet"]
+         and captured.get("env", {}).get("NOTI_PET_PID_FILE") == str(m.PET_PID_FILE)
+         and m.PET_PID_FILE.read_text() == "7777")
+finally:
+    m.PET_PID_FILE, m.BINARY = _pf, _bin
+    m.subprocess.Popen, m.time.sleep = _popen, _sleep
+
 # launch_pet confirms the process survived: an instant-exit binary (e.g. one
 # predating pet mode) is a clean error, not a false "started (pid N)", and
 # leaves no dead pid behind for --stop to trip over.

@@ -61,6 +61,7 @@
 //   NOTI_PET_WAITING_TTL seconds before a waiting state decays when no hook
 //                 clears it (default 120)
 //   NOTI_PET_DONE_TTL seconds before done/failed decay to asleep (default 6)
+//   NOTI_PET_PID_FILE pid file to remove on direct pet UI close (best-effort)
 //
 // Design notes (these are deliberate):
 //   * .accessory activation policy  -> no Dock icon, no menu bar.
@@ -1258,26 +1259,66 @@ private func crabClaw(center: NSPoint, flip: Bool, color: NSColor) {
 final class PetView: NSView {
     var mood: PetMood = .asleep { didSet { needsDisplay = true } }
     var cardSide: CardSide = .none { didSet { needsDisplay = true } }
+    var onClose: (() -> Void)?
     // Fired after a drag settles, so the driver re-anchors and re-lays-out.
     var onMoved: (() -> Void)?
     // Fired continuously during a drag so the driver can republish the live
     // anchor — a prompt that attaches mid-drag must land on the crab's CURRENT
     // spot, not the pre-drag one (otherwise: the two-crab split this avoids).
     var onDragMove: (() -> Void)?
+    private var hovering = false { didSet { needsDisplay = true } }
+    private var closeArmed = false { didSet { needsDisplay = true } }
+    private var trackingArea: NSTrackingArea?
     private var dragStartMouse = NSPoint.zero
     private var dragStartOrigin = NSPoint.zero
     private var dragged = false
 
     override var acceptsFirstResponder: Bool { false }
 
+    private var closeButtonRect: NSRect {
+        let size: CGFloat = 16
+        return NSRect(x: 8, y: petTileSize - size - 8, width: size, height: size)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        closeArmed = false
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
+        // Baseline the drag origin up front, BEFORE the close-button branch, so a
+        // fallthrough drag can never run off a stale (zero-init) baseline even if
+        // closeArmed were cleared mid-gesture. mouseExited is not delivered during
+        // a button-down drag (no .enabledDuringMouseDrag on the tracking area), so
+        // this is belt-and-suspenders — but it costs nothing and removes the hazard.
         dragStartMouse = NSEvent.mouseLocation
         dragStartOrigin = window.frame.origin
         dragged = false
+        let point = convert(event.locationInWindow, from: nil)
+        if hovering && closeButtonRect.contains(point) {
+            closeArmed = true       // press-in on the ×; mouseDragged/Up own the rest
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if closeArmed { return }
         guard let panel = window else { return }
         let now = NSEvent.mouseLocation
         if abs(now.x - dragStartMouse.x) + abs(now.y - dragStartMouse.y) > 3 { dragged = true }
@@ -1288,7 +1329,49 @@ final class PetView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if closeArmed {
+            let point = convert(event.locationInWindow, from: nil)
+            closeArmed = false
+            if closeButtonRect.contains(point) {
+                onClose?()
+            }
+            return
+        }
         if dragged { onMoved?() }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "Close pet", action: #selector(closePet(_:)), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc private func closePet(_ sender: Any?) {
+        onClose?()
+    }
+
+    private func drawCloseButton() {
+        let rect = closeButtonRect
+        let circle = NSBezierPath(ovalIn: rect)
+        NSColor.black.withAlphaComponent(closeArmed ? 0.30 : 0.20).setFill()
+        circle.fill()
+        NSColor.white.withAlphaComponent(0.45).setStroke()
+        circle.lineWidth = 1
+        circle.stroke()
+
+        let inset: CGFloat = 5
+        let glyph = NSBezierPath()
+        glyph.move(to: NSPoint(x: rect.minX + inset, y: rect.minY + inset))
+        glyph.line(to: NSPoint(x: rect.maxX - inset, y: rect.maxY - inset))
+        glyph.move(to: NSPoint(x: rect.maxX - inset, y: rect.minY + inset))
+        glyph.line(to: NSPoint(x: rect.minX + inset, y: rect.maxY - inset))
+        glyph.lineWidth = 1.6
+        glyph.lineCapStyle = .round
+        glyph.lineJoinStyle = .round
+        NSColor.white.withAlphaComponent(0.82).setStroke()
+        glyph.stroke()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1296,6 +1379,9 @@ final class PetView: NSView {
         dirtyRect.fill()
         drawCrab(in: NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize),
                  mood: mood, cardSide: cardSide)
+        if hovering {
+            drawCloseButton()
+        }
     }
 }
 
@@ -2158,6 +2244,29 @@ case "pet":
     let driver = PetDriver(chrome: chrome,
                            waitingTTL: petTimeout("NOTI_PET_WAITING_TTL", default: 120),
                            doneTTL: petTimeout("NOTI_PET_DONE_TTL", default: 6))
+    chrome.view.onClose = {
+        // A UI close is the same intent as `noti pet --stop`, and this is the only
+        // place code runs at that moment (no Python babysits the pet), so mirror
+        // stop_pet's teardown here. Clear the per-session state files so a later
+        // re-summon starts clean instead of resurrecting a stale pose (running has
+        // no TTL; a leftover `waiting` outlives the answer) — matches pet_clear.
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: petStateDir(), includingPropertiesForKeys: nil) {
+            for url in entries where url.pathExtension == "json" {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        // Remove the pid file, but only if it still names THIS process — the same
+        // pid-ownership check every Python teardown path makes, so a concurrent
+        // relaunch that reclaimed the pid file is never orphaned by our close.
+        if let pf = env["NOTI_PET_PID_FILE"], !pf.isEmpty,
+           let owned = try? String(contentsOfFile: pf, encoding: .utf8),
+           owned.trimmingCharacters(in: .whitespacesAndNewlines)
+               == String(ProcessInfo.processInfo.processIdentifier) {
+            try? FileManager.default.removeItem(atPath: pf)
+        }
+        exit(0)
+    }
     chrome.view.onMoved = { [weak driver] in driver?.petMoved() }
     chrome.view.onDragMove = { [weak driver] in driver?.petDragging() }
     NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
