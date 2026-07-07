@@ -19,7 +19,7 @@
       "git show", "which", "head", "tail", "wc",
       "whoami", "grep"
     ],
-    "bash_always_mode": "exact",
+    "bash_always_mode": "prefix",
     "mcp_autoallow_servers": [],
     "mcp_read_verbs": ["get", "list", "search", "read", "download", "find",
                        "suggest", "describe", "view"],

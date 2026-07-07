@@ -613,18 +613,22 @@ def make_rule(tool: str, tinput: dict, cfg: dict):
             # "Bash(rm -rf node_modules/*)" would allow far more than the user
             # approved. Refuse — 'Always' quietly degrades to a one-time 'Yes'.
             return None
+        if "\n" in cmd or "\r" in cmd or len(cmd) > 200:
+            # A heredoc, a CR-spliced command, or a page-long && chain can never
+            # safely become a rule in EITHER mode. Exact: it can't match a future
+            # call — nobody re-runs a 2KB script byte-identically — so the grant
+            # is pure clutter that makes the permissions file unauditable
+            # (observed: 150+ multiline entries, one 7.7KB). Prefix: worse — the
+            # first two whitespace-split "words" would splice across the newline
+            # or CR (e.g. 'Bash(cd /tmp:*)' out of a heredoc's first line),
+            # minting a broad grant the user never eyeballed. This guard runs
+            # BEFORE the prefix branch so neither mode can bypass it. Refuse; the
+            # prompt flow checks mintability BEFORE the toast and hides the Always
+            # button, so this None is never a silent downgrade.
+            return None
         if cfg["approval"]["bash_always_mode"] == "prefix":
             head = " ".join(cmd.split()[:2])
             return f"Bash({head}:*)"
-        if "\n" in cmd or "\r" in cmd or len(cmd) > 200:
-            # An exact rule for a heredoc or a page-long && chain can never
-            # match a future call — nobody re-runs a 2KB script byte-identically
-            # — so the "grant" would be pure clutter that makes the permissions
-            # file unauditable (observed: 150+ multiline entries, one 7.7KB).
-            # Refuse; same posture as the trailing-* refusal above. The prompt
-            # flow checks mintability BEFORE the toast and hides the Always
-            # button, so this None is never a silent downgrade.
-            return None
         return f"Bash({cmd})"  # exact: safe default, never broadens a verb
     if tool in EDIT_TOOLS:
         path = tinput.get("file_path") or tinput.get("notebook_path")

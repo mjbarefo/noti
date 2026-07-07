@@ -207,14 +207,23 @@ finally:
 # v0.2: Claude reads a trailing * as a prefix rule — never mint one from 'Always'
 want("no rule minted for trailing-*", m.make_rule("Bash", {"command": "rm -rf node_modules/*"}, cfg) is None)
 
-# Junk-rule refusal: an exact rule for a heredoc/multiline or oversized command
-# can never match a future call — minting one is pure settings clutter (and the
-# prompt flow hides the Always button off this same None)
-want("no rule minted for multiline", m.make_rule("Bash", {"command": "cd /tmp\npython3 - <<'PY'\nprint(1)\nPY"}, cfg) is None)
-want("no rule minted for CR",        m.make_rule("Bash", {"command": "echo a\rrm -rf /"}, cfg) is None)
-want("no rule minted over 200 chars", m.make_rule("Bash", {"command": "echo " + "x" * 200}, cfg) is None)
-want("200-char boundary still mints", m.make_rule("Bash", {"command": "e" + "x" * 199}, cfg) is not None)
-want("normal command still mints",   m.make_rule("Bash", {"command": "npm run build"}, cfg) == "Bash(npm run build)")
+# Junk/unsafe-rule refusal must hold in BOTH always-modes. A heredoc/multiline,
+# a CR-spliced command, or an oversized one can never safely become a rule: exact
+# minting is settings clutter that never matches again; prefix minting is worse —
+# the 2-word head would splice across the newline/CR (regression: prefix used to
+# skip this guard and mint e.g. 'Bash(cd /tmp:*)' out of a heredoc). The prompt
+# flow hides the Always button off this same None.
+cfg_exact  = copy.deepcopy(cfg); cfg_exact["approval"]["bash_always_mode"]  = "exact"
+cfg_prefix = copy.deepcopy(cfg); cfg_prefix["approval"]["bash_always_mode"] = "prefix"
+for _mode, _c in (("exact", cfg_exact), ("prefix", cfg_prefix)):
+    want(f"[{_mode}] no rule minted for multiline", m.make_rule("Bash", {"command": "cd /tmp\npython3 - <<'PY'\nprint(1)\nPY"}, _c) is None)
+    want(f"[{_mode}] no rule minted for CR",        m.make_rule("Bash", {"command": "echo a\rrm -rf /"}, _c) is None)
+    want(f"[{_mode}] no rule minted over 200 chars", m.make_rule("Bash", {"command": "echo " + "x" * 200}, _c) is None)
+    want(f"[{_mode}] 200-char boundary still mints", m.make_rule("Bash", {"command": "e" + "x" * 199}, _c) is not None)
+# Minting form is mode-specific: exact grants the whole command; prefix grants
+# the first two words as a word-boundary prefix rule.
+want("exact mode mints the exact command",  m.make_rule("Bash", {"command": "npm run build"}, cfg_exact)  == "Bash(npm run build)")
+want("prefix mode mints the 2-word prefix", m.make_rule("Bash", {"command": "npm run build"}, cfg_prefix) == "Bash(npm run:*)")
 
 # v0.2: Claude's documented pattern forms are recognized (fewer needless toasts)
 want("bash 'cmd *' prefix form",      m.pattern_matches("Bash", {"command":"npm run build"}, "Bash(npm run *)"))
