@@ -15,6 +15,11 @@
 //       Hovering holds the card open (you're reading it); leaving relights
 //       a short fuse.
 //
+//   noti-toast pet
+//       Shows a long-lived, non-activating floating companion. It watches
+//       NOTI_PET_STATE_DIR for per-session state files written by the Python
+//       hook adapter and reflects the most urgent state. It never becomes key.
+//
 // Optional environment:
 //   NOTI_TIMEOUT  seconds (ask: hard cap before exit 124; summary: dismiss delay)
 //   NOTI_SLOT     integer stack index — offsets the toast so concurrent toasts
@@ -52,6 +57,10 @@
 //                 preview-toasts skill), works in both palettes.
 //   NOTI_APPEARANCE  light | dark — force a palette (snapshot/design review
 //                 aid; live toasts follow the system)
+//   NOTI_PET_STATE_DIR  directory of pet state JSON files, one per session
+//   NOTI_PET_WAITING_TTL seconds before a waiting state decays when no hook
+//                 clears it (default 120)
+//   NOTI_PET_DONE_TTL seconds before done/failed decay to asleep (default 6)
 //
 // Design notes (these are deliberate):
 //   * .accessory activation policy  -> no Dock icon, no menu bar.
@@ -101,7 +110,7 @@ let env = ProcessInfo.processInfo.environment
 let args = Array(CommandLine.arguments.dropFirst())
 
 guard let mode = args.first else {
-    FileHandle.standardError.write(Data("usage: noti-toast ask|summary ...\n".utf8))
+    FileHandle.standardError.write(Data("usage: noti-toast ask|summary|pet ...\n".utf8))
     exit(64)
 }
 
@@ -118,7 +127,7 @@ if let forced = env["NOTI_APPEARANCE"] {
 // Geometry + text helpers
 // ----------------------------------------------------------------------------
 
-func targetScreen() -> NSScreen {
+@Sendable func targetScreen() -> NSScreen {
     let mouse = NSEvent.mouseLocation
     for s in NSScreen.screens where NSMouseInRect(mouse, s.frame, false) { return s }
     return NSScreen.main ?? NSScreen.screens[0]
@@ -278,8 +287,72 @@ final class HoverEffectView: NSVisualEffectView {
     override func mouseExited(with event: NSEvent) { inside = false; onLeave?() }
 }
 
-func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
-    let panel = KeyablePanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+// Where the pet's resting crab is (plus its screen), so an attached ask card can
+// grow out of it while staying fully on-screen.
+struct AttachSpec {
+    let anchor: NSPoint      // the crab tile's screen origin (bottom-left of its 72pt tile)
+    let vf: NSRect           // visible frame of the pet's screen — the box the card must fit in
+}
+
+// Resolve the live crab position for an attached prompt, or nil when the toast
+// is not attached (NOTI_ATTACH unset). Prefers the `.anchor` file the pet
+// republishes on every move — it survives drags and sidesteps any question of
+// whether a bare CLI tool's UserDefaults domain is shared — then falls back to
+// the persisted position, then the corner.
+func attachSpec() -> AttachSpec? {
+    guard env["NOTI_ATTACH"] == "1" else { return nil }
+    let tile = NSSize(width: petTileSize, height: petTileSize)
+    var origin: NSPoint?
+    if let dir = env["NOTI_PET_STATE_DIR"], !dir.isEmpty {
+        let url = URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent(".anchor")
+        if let raw = try? String(contentsOf: url, encoding: .utf8) {
+            let nums = raw.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+                          .compactMap { Double($0) }
+            if nums.count == 2 { origin = NSPoint(x: nums[0], y: nums[1]) }
+        }
+    }
+    let anchor = petClampedOrigin(origin ?? PetPositionStore.load(size: tile), size: tile)
+    let vf = petScreen(for: anchor, size: tile)?.visibleFrame ?? targetScreen().visibleFrame
+    return AttachSpec(anchor: anchor, vf: vf)
+}
+
+// Resolved geometry for an attached card of a specific size. The crab lands on
+// the pet's anchor so it occludes the resting pet; the card grows into whichever
+// side has the most room — horizontally (crabOnLeft) AND vertically (crabY: the
+// crab tile's offset within the H-tall card, H-72 = crab at the card's top so it
+// falls below, 0 = crab at the bottom so it rises above). A final clamp keeps the
+// whole card on-screen even for a tall multi-option question or a narrow display:
+// a few px of crab drift (a faint ghost of the pet) is the accepted cost of a
+// fully-visible, answerable card — which matters far more than pixel occlusion.
+struct AttachLayout {
+    let crabOnLeft: Bool
+    let crabY: CGFloat
+    let origin: NSPoint
+}
+
+func attachLayout(_ spec: AttachSpec, cardW W: CGFloat, cardH H: CGFloat) -> AttachLayout {
+    let tile = petTileSize
+    let a = spec.anchor, vf = spec.vf
+    // Horizontal: grow into the side that fits the whole card, else the roomier.
+    let roomRight = vf.maxX - (a.x + tile)
+    let roomLeft = a.x - vf.minX
+    let crabOnLeft = (roomRight >= W) || (roomRight >= roomLeft)
+    // Vertical: grow toward the side with more room, so a card taller than the
+    // 72pt tile never overflows the way a symmetric centre would at a corner.
+    let roomBelow = a.y - vf.minY
+    let roomAbove = vf.maxY - (a.y + tile)
+    let crabY: CGFloat = (roomBelow >= roomAbove) ? (H - tile) : 0
+    var origin = NSPoint(x: crabOnLeft ? a.x : a.x - W, y: a.y - crabY)
+    // Clamp the full card into the visible frame; the inner max() guards the
+    // pathological card-bigger-than-screen case from inverting the bound.
+    origin.x = min(max(origin.x, vf.minX), max(vf.minX, vf.maxX - (W + tile)))
+    origin.y = min(max(origin.y, vf.minY), max(vf.minY, vf.maxY - H))
+    return AttachLayout(crabOnLeft: crabOnLeft, crabY: crabY, origin: origin)
+}
+
+func makeCard(width: CGFloat, height: CGFloat, attach layout: AttachLayout? = nil) -> (NSPanel, HoverEffectView) {
+    let crabW: CGFloat = layout != nil ? petTileSize : 0
+    let panel = KeyablePanel(contentRect: NSRect(x: 0, y: 0, width: width + crabW, height: height),
                              styleMask: [.borderless, .nonactivatingPanel],
                              backing: .buffered, defer: false)
     panel.level = .floating
@@ -291,7 +364,7 @@ func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
     panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
     panel.acceptsMouseMovedEvents = true
 
-    let vev = HoverEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    let vev = HoverEffectView(frame: NSRect(x: 0, y: 0, width: width + crabW, height: height))
     vev.material = .popover                       // system-notification depth, not HUD smoke
     vev.state = .active
     vev.blendingMode = .behindWindow
@@ -302,6 +375,35 @@ func makeCard(width: CGFloat, height: CGFloat) -> (NSPanel, HoverEffectView) {
     vev.layer?.borderWidth = 1
     vev.layer?.borderColor = hairline.cgColor     // definition against busy backdrops
     panel.contentView = vev
+
+    if let layout {
+        // Attached mode: one frosted surface wide enough to wear the crab as its
+        // leading icon, positioned (by attachLayout) so the crab tile lands on
+        // the resting pet and the card grows into on-screen room. The card is at
+        // least as big as the pet's 72pt tile in both dimensions, so it fully
+        // occludes the pet underneath — the pet is revealed again, unchanged, the
+        // instant this card retracts. No corner origin, no slot column: the pet's
+        // spot is the position, and attached cards don't stack in the corner (a
+        // second concurrent one overlaps here, top-answerable first — the
+        // documented edge; the standing pet still counts them all).
+        let crabX: CGFloat = layout.crabOnLeft ? 0 : width
+        // An attached card is always a "needs you" summons; .waiting is the right
+        // pose and — because the card occludes the pet — it is also the only crab
+        // the user sees, so it can't clash with the pet's momentarily-stale pose.
+        let crab = CrabIconView(frame: NSRect(x: crabX, y: layout.crabY,
+                                              width: petTileSize, height: petTileSize))
+        crab.mood = .waiting
+        crab.cardSide = layout.crabOnLeft ? .right : .left   // claw toward the card body
+        // Pin the crab to its own edge so the unfurl (a width-only frame
+        // animation in present()) sweeps the card out from behind a crab that
+        // never budges; height never animates, so the vertical margins just hold
+        // it at crabY.
+        crab.autoresizingMask = layout.crabOnLeft ? [.maxXMargin, .minYMargin, .maxYMargin]
+                                                  : [.minXMargin, .minYMargin, .maxYMargin]
+        vev.addSubview(crab)
+        panel.setFrameOrigin(layout.origin)
+        return (panel, vev)
+    }
 
     // screen resolved ONCE — the reflow tick below must re-pack the column,
     // not chase the mouse to another monitor mid-display
@@ -424,6 +526,35 @@ func timeoutSeconds(default def: Double) -> Double {
 func present(_ panel: NSPanel) {
     let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     let target = panel.frame
+    if let onLeft = attachCrabOnLeft {
+        // Unfurl out of the crab: start collapsed to just the crab tile, then
+        // grow horizontally to full width. The card content is revealed by the
+        // surface's clip as the width opens; the crab, pinned to its edge by
+        // autoresizing, holds still — so the card reads as sweeping out from
+        // behind the crab. Height/origin.y never change, so there is no vertical
+        // lurch and the crab stays exactly over the pet it is occluding.
+        panel.alphaValue = 0
+        if reduce {                                   // reduce-motion: pure fade at full size
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.12
+                panel.animator().alphaValue = 1
+            }
+            return
+        }
+        var collapsed = target
+        collapsed.size.width = petTileSize
+        if !onLeft { collapsed.origin.x = target.maxX - petTileSize }   // crab-on-right: pin the right edge
+        panel.setFrame(collapsed, display: true)
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            ctx.timingFunction = settleCurve
+            panel.animator().alphaValue = 1
+            panel.animator().setFrame(target, display: true)
+        }
+        return
+    }
     if !reduce {
         let dx: CGFloat = (env["NOTI_CORNER"] ?? "top-right").hasSuffix("left") ? -24 : 24
         panel.setFrameOrigin(NSPoint(x: target.origin.x + dx, y: target.origin.y))
@@ -448,6 +579,11 @@ func present(_ panel: NSPanel) {
 
 var activePanel: NSPanel?      // set by each mode right after makeCard
 var dismissing = false         // the first answer wins, forever
+// Set when an ask card is attached to the pet (crab-on-left true/false, else
+// nil). It flips present()/dismissThenExit() from the corner slide to a
+// horizontal unfurl/retract out of / into the crab, so the interactive card
+// reads as the pet growing a card rather than a second window arriving.
+var attachCrabOnLeft: Bool?
 // noti's own belief about key status, maintained at the two makeKey() sites
 // and the didResignKey observer. Deliberately NOT panel.isKeyWindow: that
 // property is @MainActor-annotated in current SDKs and reading it from a
@@ -488,9 +624,19 @@ func dismissThenExit(code: Int32, output: String? = nil, duration: TimeInterval 
         ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
         panel.animator().alphaValue = 0
         if !reduce {
-            var f = panel.frame
-            f.origin.x += (env["NOTI_CORNER"] ?? "top-right").hasSuffix("left") ? -14 : 14
-            panel.animator().setFrame(f, display: true)
+            if let onLeft = attachCrabOnLeft {
+                // retract the card back into the crab — the exact reverse of the
+                // unfurl, so an answered prompt folds away and the pet (already
+                // underneath, now in its post-answer mood) is what remains
+                var f = panel.frame
+                if !onLeft { f.origin.x = f.maxX - petTileSize }   // keep the crab's right edge fixed
+                f.size.width = petTileSize
+                panel.animator().setFrame(f, display: true)
+            } else {
+                var f = panel.frame
+                f.origin.x += (env["NOTI_CORNER"] ?? "top-right").hasSuffix("left") ? -14 : 14
+                panel.animator().setFrame(f, display: true)
+            }
         }
     }, completionHandler: { exit(code) })
 }
@@ -943,6 +1089,617 @@ final class CommitDelegate: NSObject, NSTextFieldDelegate {
 }
 
 // ----------------------------------------------------------------------------
+// Pet mode — a long-lived reader, never a hook path.
+// ----------------------------------------------------------------------------
+
+enum PetMood: String {
+    case asleep, running, done, failed, waiting
+
+    var urgency: Int {
+        switch self {
+        case .asleep: return 0
+        case .running: return 1
+        case .done: return 2
+        case .failed: return 3
+        case .waiting: return 4
+        }
+    }
+}
+
+struct PetSession {
+    let id: String
+    let mood: PetMood
+    let project: String
+}
+
+final class PetPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+// The pet is a single object that delivers its own notification: a crab tile
+// that, on a summons, unfurls one frosted card ("Claude needs you · project")
+// out of itself, and collapses back to just the crab when nothing is needed.
+let petTileSize: CGFloat = 72     // the crab square, resting footprint
+let petCardWidth: CGFloat = 216   // the card that grows out of the crab
+
+// Which side a presented card sits on, so the crab raises the claw on that
+// side as a "here — look" gesture toward the message. `.none` while resting.
+// Top-level (not nested in PetView) so the attached prompt card can wear the
+// crab with the same claw-toward-the-card gesture the pet uses.
+enum CardSide { case none, left, right }
+
+// The crab is painted by a free renderer, not a PetView method, so two surfaces
+// can draw the identical critter: the long-lived pet, and the interactive prompt
+// card that unfurls out of it. The card wearing the same crab at the same screen
+// point is what makes the toast read as the pet growing a card rather than a
+// second window landing beside it.
+private let crabInk = NSColor(srgbRed: 0.18, green: 0.12, blue: 0.10, alpha: 1)
+
+private func crabPalette(_ mood: PetMood) -> (shell: NSColor, accent: NSColor) {
+    switch mood {
+    case .asleep:
+        return (NSColor(srgbRed: 0.58, green: 0.56, blue: 0.53, alpha: 0.92),
+                NSColor(srgbRed: 0.34, green: 0.34, blue: 0.34, alpha: 1))
+    case .running: return (claude, .systemTeal)
+    case .done:    return (claude, .systemGreen)
+    case .failed:  return (.systemRed, .systemYellow)
+    case .waiting: return (claude, .systemYellow)
+    }
+}
+
+// Paint the crab into `square` (its own 72pt tile in the caller's coordinates).
+// The crab carries only its own state (eyes / a done or failed glyph); every
+// word lives in whatever card sits beside it, so a resting crab stays inert.
+func drawCrab(in square: NSRect, mood: PetMood, cardSide: CardSide) {
+    let base = square.insetBy(dx: 5, dy: 5)
+    let shell = NSRect(x: base.minX + 8, y: base.minY + 11,
+                       width: base.width - 16, height: base.height - 23)
+    let (shellColor, accent) = crabPalette(mood)
+    let ink = crabInk
+
+    crabLegs(shell: shell, color: shellColor.shadow(withLevel: 0.18) ?? shellColor)
+    // Raise the claw on the card side toward the message it presents.
+    crabClaw(center: NSPoint(x: shell.minX - 2, y: shell.midY + (cardSide == .left ? 13 : 4)),
+             flip: false, color: shellColor)
+    crabClaw(center: NSPoint(x: shell.maxX + 2, y: shell.midY + (cardSide == .right ? 13 : 4)),
+             flip: true, color: shellColor)
+
+    let body = NSBezierPath(ovalIn: shell)
+    shellColor.setFill()
+    body.fill()
+    (shellColor.shadow(withLevel: 0.25) ?? shellColor).setStroke()
+    body.lineWidth = 1.5
+    body.stroke()
+
+    switch mood {
+    case .asleep:
+        crabClosedEyes(shell: shell, ink: ink)
+        crabText("z", in: NSRect(x: shell.maxX - 5, y: shell.maxY - 2, width: 13, height: 13),
+                 size: 11, color: NSColor.white.withAlphaComponent(0.9), bold: true)
+    case .running:
+        crabEyes(shell: shell, ink: ink)
+    case .done:
+        crabEyes(shell: shell, ink: ink)
+        crabText("✓", in: NSRect(x: shell.minX, y: shell.midY - 14, width: shell.width, height: 24),
+                 size: 21, color: accent, bold: true)
+    case .failed:
+        crabEyes(shell: shell, ink: ink)
+        crabText("!", in: NSRect(x: shell.minX, y: shell.midY - 14, width: shell.width, height: 24),
+                 size: 22, color: accent, bold: true)
+    case .waiting:
+        crabEyes(shell: shell, ink: ink)
+    }
+}
+
+private func crabText(_ text: String, in rect: NSRect, size: CGFloat, color: NSColor, bold: Bool) {
+    let style = NSMutableParagraphStyle()
+    style.alignment = .center
+    let font = bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size)
+    (text as NSString).draw(in: rect, withAttributes: [
+        .font: font,
+        .foregroundColor: color,
+        .paragraphStyle: style,
+    ])
+}
+
+private func crabEyes(shell: NSRect, ink: NSColor) {
+    ink.setFill()
+    NSBezierPath(ovalIn: NSRect(x: shell.midX - 12, y: shell.midY + 5, width: 5, height: 7)).fill()
+    NSBezierPath(ovalIn: NSRect(x: shell.midX + 7, y: shell.midY + 5, width: 5, height: 7)).fill()
+}
+
+private func crabClosedEyes(shell: NSRect, ink: NSColor) {
+    ink.setStroke()
+    for x in [shell.midX - 12, shell.midX + 7] {
+        let eye = NSBezierPath()
+        eye.move(to: NSPoint(x: x, y: shell.midY + 8))
+        eye.curve(to: NSPoint(x: x + 6, y: shell.midY + 8),
+                  controlPoint1: NSPoint(x: x + 2, y: shell.midY + 5),
+                  controlPoint2: NSPoint(x: x + 4, y: shell.midY + 5))
+        eye.lineWidth = 1.4
+        eye.stroke()
+    }
+}
+
+private func crabLegs(shell: NSRect, color: NSColor) {
+    color.setStroke()
+    for yOff in [6.0, 16.0, 26.0] {
+        let left = NSBezierPath()
+        left.move(to: NSPoint(x: shell.minX + 8, y: shell.minY + yOff))
+        left.line(to: NSPoint(x: shell.minX - 2, y: shell.minY + yOff - 4))
+        left.lineWidth = 2
+        left.lineCapStyle = .round
+        left.stroke()
+        let right = NSBezierPath()
+        right.move(to: NSPoint(x: shell.maxX - 8, y: shell.minY + yOff))
+        right.line(to: NSPoint(x: shell.maxX + 2, y: shell.minY + yOff - 4))
+        right.lineWidth = 2
+        right.lineCapStyle = .round
+        right.stroke()
+    }
+}
+
+private func crabClaw(center: NSPoint, flip: Bool, color: NSColor) {
+    color.setStroke()
+    let dir: CGFloat = flip ? 1 : -1
+    let arm = NSBezierPath()
+    arm.move(to: center)
+    arm.line(to: NSPoint(x: center.x + dir * 11, y: center.y + 5))
+    arm.lineWidth = 3
+    arm.lineCapStyle = .round
+    arm.stroke()
+    let claw = NSBezierPath()
+    claw.appendOval(in: NSRect(x: center.x + dir * 10 - 5, y: center.y + 1, width: 10, height: 10))
+    color.setFill()
+    claw.fill()
+}
+
+final class PetView: NSView {
+    var mood: PetMood = .asleep { didSet { needsDisplay = true } }
+    var cardSide: CardSide = .none { didSet { needsDisplay = true } }
+    // Fired after a drag settles, so the driver re-anchors and re-lays-out.
+    var onMoved: (() -> Void)?
+    // Fired continuously during a drag so the driver can republish the live
+    // anchor — a prompt that attaches mid-drag must land on the crab's CURRENT
+    // spot, not the pre-drag one (otherwise: the two-crab split this avoids).
+    var onDragMove: (() -> Void)?
+    private var dragStartMouse = NSPoint.zero
+    private var dragStartOrigin = NSPoint.zero
+    private var dragged = false
+
+    override var acceptsFirstResponder: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        dragStartMouse = NSEvent.mouseLocation
+        dragStartOrigin = window.frame.origin
+        dragged = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let panel = window else { return }
+        let now = NSEvent.mouseLocation
+        if abs(now.x - dragStartMouse.x) + abs(now.y - dragStartMouse.y) > 3 { dragged = true }
+        let proposed = NSPoint(x: dragStartOrigin.x + now.x - dragStartMouse.x,
+                               y: dragStartOrigin.y + now.y - dragStartMouse.y)
+        panel.setFrameOrigin(petClampedOrigin(proposed, size: panel.frame.size))
+        onDragMove?()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragged { onMoved?() }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill()
+        drawCrab(in: NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize),
+                 mood: mood, cardSide: cardSide)
+    }
+}
+
+// The crab an attached prompt card wears as its leading icon: the same critter,
+// but with no drag or hit behavior — it is part of the interactive toast, not
+// the movable pet. Click-through (hitTest -> nil) so it can never swallow a
+// stray click meant for the card that surrounds it.
+final class CrabIconView: NSView {
+    var mood: PetMood = .waiting { didSet { needsDisplay = true } }
+    var cardSide: CardSide = .none { didSet { needsDisplay = true } }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        drawCrab(in: NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize),
+                 mood: mood, cardSide: cardSide)
+    }
+}
+
+enum PetPositionStore {
+    static let xKey = "noti.pet.x"
+    static let yKey = "noti.pet.y"
+
+    static func load(size: NSSize) -> NSPoint {
+        let d = UserDefaults.standard
+        if d.object(forKey: xKey) != nil, d.object(forKey: yKey) != nil {
+            return petClampedOrigin(NSPoint(x: d.double(forKey: xKey), y: d.double(forKey: yKey)), size: size)
+        }
+        let vf = targetScreen().visibleFrame
+        return petClampedOrigin(origin(in: vf, width: size.width, height: size.height, stack: 0), size: size)
+    }
+
+    static func save(_ origin: NSPoint) {
+        UserDefaults.standard.set(Double(origin.x), forKey: xKey)
+        UserDefaults.standard.set(Double(origin.y), forKey: yKey)
+    }
+}
+
+@Sendable func petScreen(for origin: NSPoint, size: NSSize) -> NSScreen? {
+    let rect = NSRect(origin: origin, size: size)
+    let center = NSPoint(x: rect.midX, y: rect.midY)
+    for screen in NSScreen.screens where screen.visibleFrame.contains(center) {
+        return screen
+    }
+    // Nearest screen by center-distance; nil only when NSScreen.screens is
+    // empty, which macOS can transiently report mid-undock / display-sleep.
+    return NSScreen.screens.max { a, b in
+        let adx = center.x - a.visibleFrame.midX
+        let ady = center.y - a.visibleFrame.midY
+        let bdx = center.x - b.visibleFrame.midX
+        let bdy = center.y - b.visibleFrame.midY
+        return (adx * adx + ady * ady) > (bdx * bdx + bdy * bdy)
+    }
+}
+
+func petClampedOrigin(_ origin: NSPoint, size: NSSize) -> NSPoint {
+    // The pet re-clamps from a long-lived didChangeScreenParametersNotification
+    // observer — exactly when the display list churns and can momentarily be
+    // empty. With no screen, leave the origin untouched (never force-index an
+    // empty NSScreen.screens); the next screen-param event re-clamps.
+    guard let screen = petScreen(for: origin, size: size) else { return origin }
+    let vf = screen.visibleFrame.insetBy(dx: 4, dy: 4)
+    return NSPoint(x: min(max(origin.x, vf.minX), vf.maxX - size.width),
+                   y: min(max(origin.y, vf.minY), vf.maxY - size.height))
+}
+
+func petTimeout(_ name: String, default def: Double) -> Double {
+    max(1, Double(env[name] ?? "") ?? def)
+}
+
+func petStateDir() -> URL {
+    if let raw = env["NOTI_PET_STATE_DIR"], !raw.isEmpty {
+        return URL(fileURLWithPath: raw, isDirectory: true)
+    }
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    return home.appendingPathComponent(".config/noti/pet", isDirectory: true)
+}
+
+func petParseSession(_ url: URL, now: Date, waitingTTL: Double, doneTTL: Double) -> PetSession? {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+    let modified = (attrs?[.modificationDate] as? Date) ?? now
+    let age = now.timeIntervalSince(modified)
+    let data = try? Data(contentsOf: url)
+    var mood: PetMood = .running
+    var project = url.deletingPathExtension().lastPathComponent
+
+    if let data,
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if let s = obj["state"] as? String, let parsed = PetMood(rawValue: s) { mood = parsed }
+        if let p = obj["project"] as? String, !p.isEmpty { project = p }
+    } else if let data,
+              let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty {
+        let parts = raw.split(separator: " ", maxSplits: 1).map(String.init)
+        if let parsed = PetMood(rawValue: parts[0]) { mood = parsed }
+        if parts.count > 1 { project = parts[1] }
+    }
+    if mood == .waiting && age > waitingTTL { return nil }
+    if (mood == .done || mood == .failed) && age > doneTTL { return nil }
+    return PetSession(id: url.deletingPathExtension().lastPathComponent,
+                      mood: mood, project: project)
+}
+
+func petReadSessions(waitingTTL: Double, doneTTL: Double) -> [PetSession] {
+    let dir = petStateDir()
+    guard let urls = try? FileManager.default.contentsOfDirectory(
+        at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+    ) else { return [] }
+    let now = Date()
+    return urls.compactMap { url in
+        // The writer's contract is one `<sid>.json` per session (pet_session_path
+        // in the Python). Ignore everything else so a mid-write atomic temp file
+        // (`<sid>.json.tmp.<pid>`) or any stray drop-in can't be counted as a
+        // phantom session — a torn tmp read would otherwise default to `running`
+        // and never expire.
+        guard url.pathExtension == "json" else { return nil }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+              !isDir.boolValue else { return nil }
+        return petParseSession(url, now: now, waitingTTL: waitingTTL, doneTTL: doneTTL)
+    }
+}
+
+func petSummary(_ sessions: [PetSession]) -> (PetMood, String) {
+    guard let top = sessions.max(by: { $0.mood.urgency < $1.mood.urgency }) else {
+        return (.asleep, "asleep")
+    }
+    // Charter carve-out: outside the summons the pet stays inert — no counts,
+    // no project names, no lists. Only a summons mood (a human is actually
+    // needed: `waiting`, or `failed` once StopFailure ships) may name who needs
+    // you or count them; every other mood shows just its own state word. A calm
+    // running/done crab must never read as "2 sessions".
+    guard top.mood == .waiting || top.mood == .failed else {
+        return (top.mood, top.mood.rawValue)
+    }
+    let matching = sessions.filter { $0.mood == top.mood }
+    if matching.count == 1 {
+        return (top.mood, matching[0].project)
+    }
+    return (top.mood, "\(matching.count) sessions")
+}
+
+struct PetChrome {
+    let panel: PetPanel
+    let surface: NSVisualEffectView
+    let view: PetView
+    let titleLabel: NSTextField
+    let subtitleLabel: NSTextField
+}
+
+final class PetDriver {
+    private let panel: PetPanel
+    private let view: PetView
+    private let titleLabel: NSTextField
+    private let subtitleLabel: NSTextField
+    private let waitingTTL: Double
+    private let doneTTL: Double
+    private var watcher: DispatchSourceFileSystemObject?
+    private var pending = false
+    private var lastSignature = ""
+    // The crab's resting origin in screen space — the fixed point a presented
+    // card unfurls from, and what PetPositionStore persists.
+    private var anchor: NSPoint
+    private var presenting = false
+
+    init(chrome: PetChrome, waitingTTL: Double, doneTTL: Double) {
+        self.panel = chrome.panel
+        self.view = chrome.view
+        self.titleLabel = chrome.titleLabel
+        self.subtitleLabel = chrome.subtitleLabel
+        self.waitingTTL = waitingTTL
+        self.doneTTL = doneTTL
+        self.anchor = chrome.panel.frame.origin
+    }
+
+    func start() {
+        try? FileManager.default.createDirectory(at: petStateDir(), withIntermediateDirectories: true)
+        let fd = open(petStateDir().path, O_EVTONLY)
+        if fd >= 0 {
+            let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
+                                                                eventMask: [.write, .delete, .rename],
+                                                                queue: .main)
+            src.setEventHandler { [weak self] in
+                guard let self, !self.pending else { return }
+                self.pending = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.pending = false
+                    self.refresh()
+                }
+            }
+            src.setCancelHandler { close(fd) }
+            src.resume()
+            watcher = src
+        }
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        applyLayout(presenting: false, animated: false)
+        writeAnchor()
+        refresh()
+    }
+
+    // Republish the crab's resting origin so an attached prompt card grows out
+    // of exactly where the pet sits — kept current across drags and re-clamps.
+    // Best-effort: a failed write only means the next attached card falls back
+    // to the persisted (possibly pre-drag) position, never a blocked anything.
+    private var lastAnchorWrite = NSPoint(x: -1e9, y: -1e9)
+    private func writeAnchor() {
+        let url = petStateDir().appendingPathComponent(".anchor")
+        try? "\(Int(anchor.x)) \(Int(anchor.y))".write(to: url, atomically: true, encoding: .utf8)
+        lastAnchorWrite = anchor
+    }
+
+    // Live-drag republish, throttled to ~6pt of movement so a fast drag doesn't
+    // hammer the file (each write also self-pings the pet's dir watcher). No
+    // relayout here — the drag itself moves the window; we only keep .anchor
+    // current so a prompt attaching mid-drag lands on the crab, not its origin.
+    func petDragging() {
+        let live = NSPoint(x: panel.frame.origin.x + view.frame.origin.x,
+                           y: panel.frame.origin.y + view.frame.origin.y)
+        guard abs(live.x - lastAnchorWrite.x) + abs(live.y - lastAnchorWrite.y) >= 6 else { return }
+        anchor = live
+        writeAnchor()
+    }
+
+    // A summons is the only thing that presents a card; everything else rests.
+    private func isSummons(_ m: PetMood) -> Bool { m == .waiting || m == .failed }
+
+    func refresh() {
+        let sessions = petReadSessions(waitingTTL: waitingTTL, doneTTL: doneTTL)
+            .sorted { $0.id < $1.id }
+        let (mood, caption) = petSummary(sessions)
+        let signature = sessions.map { "\($0.id):\($0.mood.rawValue):\($0.project)" }
+            .joined(separator: "|") + "=>\(mood.rawValue):\(caption)"
+        guard signature != lastSignature else { return }
+        let old = view.mood
+        lastSignature = signature
+        view.mood = mood
+
+        let wantPresenting = isSummons(mood)
+        if wantPresenting {                             // the card carries the words
+            titleLabel.stringValue = mood == .failed ? "A turn failed" : "Claude needs you"
+            subtitleLabel.stringValue = caption
+        }
+        if wantPresenting != presenting {
+            applyLayout(presenting: wantPresenting, animated: true)
+        }
+        if old != mood && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            pulse()
+        }
+    }
+
+    private func pulse() {
+        // NSView backing layers anchor at (0,0); build the scale about the
+        // crab's own centre so the pulse settles in place, not from a corner.
+        let cx = view.bounds.width / 2, cy = view.bounds.height / 2
+        func scaleAboutCenter(_ s: CGFloat) -> CATransform3D {
+            var t = CATransform3DMakeTranslation(cx, cy, 0)
+            t = CATransform3DScale(t, s, s, 1)
+            return CATransform3DTranslate(t, -cx, -cy, 0)
+        }
+        let a = CABasicAnimation(keyPath: "transform")
+        a.fromValue = scaleAboutCenter(0.92)
+        a.toValue = scaleAboutCenter(1.0)
+        a.duration = 0.18
+        a.timingFunction = settleCurve
+        view.layer?.add(a, forKey: "pet-state-pulse")
+    }
+
+    // The card unfurls into whichever side has room, so the crab never has to
+    // move off its corner: crab-on-left when it rests on the left half.
+    private func crabOnLeft() -> Bool {
+        let tile = NSSize(width: petTileSize, height: petTileSize)
+        guard let vf = petScreen(for: anchor, size: tile)?.visibleFrame else { return true }
+        return (anchor.x + petTileSize / 2) < vf.midX
+    }
+
+    private func applyLayout(presenting: Bool, animated: Bool) {
+        self.presenting = presenting
+        let onLeft = crabOnLeft()
+        let tile = petTileSize
+        let panelW = presenting ? tile + petCardWidth : tile
+        let originX = (presenting && !onLeft) ? anchor.x - petCardWidth : anchor.x
+        var frame = NSRect(x: originX, y: anchor.y, width: panelW, height: tile)
+        frame.origin = petClampedOrigin(frame.origin, size: frame.size)
+
+        // Pin the crab to its side so an animated resize keeps it stationary
+        // while the card grows out of the opposite edge.
+        view.autoresizingMask = onLeft ? [.maxXMargin] : [.minXMargin]
+        view.cardSide = presenting ? (onLeft ? .right : .left) : .none
+
+        // Card text: on the far side from the crab, vertically centred.
+        let pad: CGFloat = 14
+        let cardX: CGFloat = onLeft ? tile : 0
+        let textW = petCardWidth - 2 * pad
+        let titleH = lineHeight(titleLabel.font ?? NSFont.systemFont(ofSize: 13))
+        let subH = lineHeight(subtitleLabel.font ?? NSFont.systemFont(ofSize: 11))
+        let gap: CGFloat = 2
+        let blockY = (tile - (titleH + gap + subH)) / 2
+        subtitleLabel.frame = NSRect(x: cardX + pad, y: blockY, width: textW, height: subH)
+        titleLabel.frame = NSRect(x: cardX + pad, y: blockY + subH + gap, width: textW, height: titleH)
+        let labelMask: NSView.AutoresizingMask = onLeft ? [.minXMargin] : [.maxXMargin]
+        titleLabel.autoresizingMask = labelMask
+        subtitleLabel.autoresizingMask = labelMask
+
+        if presenting {                                 // revealed as the card grows
+            titleLabel.isHidden = false
+            subtitleLabel.isHidden = false
+        }
+        if !animated {                                  // no resize animation to run autoresizing
+            view.frame = NSRect(x: onLeft ? 0 : panelW - tile, y: 0, width: tile, height: tile)
+        }
+
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.2
+                ctx.timingFunction = settleCurve
+                self.panel.animator().setFrame(frame, display: true)
+            }, completionHandler: {
+                self.view.frame = NSRect(x: onLeft ? 0 : self.panel.frame.width - tile,
+                                         y: 0, width: tile, height: tile)
+                if !presenting {
+                    self.titleLabel.isHidden = true
+                    self.subtitleLabel.isHidden = true
+                }
+            })
+        } else {
+            panel.setFrame(frame, display: true)
+            if !presenting {
+                titleLabel.isHidden = true
+                subtitleLabel.isHidden = true
+            }
+        }
+    }
+
+    // Re-anchor after a drag: the crab's screen origin becomes the new anchor,
+    // and the card may flip to the now-roomier side.
+    func petMoved() {
+        anchor = NSPoint(x: panel.frame.origin.x + view.frame.origin.x,
+                         y: panel.frame.origin.y + view.frame.origin.y)
+        PetPositionStore.save(anchor)
+        writeAnchor()
+        applyLayout(presenting: presenting, animated: false)
+    }
+
+    // Screen params changed (undock / display sleep) — keep the crab on-screen.
+    func reclamp() {
+        anchor = petClampedOrigin(anchor, size: NSSize(width: petTileSize, height: petTileSize))
+        PetPositionStore.save(anchor)
+        writeAnchor()
+        applyLayout(presenting: presenting, animated: false)
+    }
+}
+
+func makePetPanel() -> PetChrome {
+    let tile = NSSize(width: petTileSize, height: petTileSize)
+    let panel = PetPanel(contentRect: NSRect(origin: .zero, size: tile),
+                         styleMask: [.borderless, .nonactivatingPanel],
+                         backing: .buffered, defer: false)
+    panel.level = .floating
+    panel.isFloatingPanel = true
+    panel.hidesOnDeactivate = false
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+    panel.acceptsMouseMovedEvents = true
+
+    // One frosted surface with the toast's exact DNA (makeCard) — same .popover
+    // vibrancy, 16pt continuous corner, hairline border — so the pet is a member
+    // of the toast family, not a separate app icon. It IS the delivery surface:
+    // it grows into a card on a summons. The crab draws transparently on top and
+    // the surface's clip reveals the card as it unfurls.
+    let surface = NSVisualEffectView(frame: NSRect(origin: .zero, size: tile))
+    surface.autoresizingMask = [.width, .height]
+    surface.material = .popover
+    surface.state = .active
+    surface.blendingMode = .behindWindow
+    surface.wantsLayer = true
+    surface.layer?.cornerRadius = 16
+    surface.layer?.cornerCurve = .continuous
+    surface.layer?.masksToBounds = true
+    surface.layer?.borderWidth = 1
+    surface.layer?.borderColor = hairline.cgColor
+    panel.contentView = surface
+
+    let pet = PetView(frame: NSRect(origin: .zero, size: tile))
+    pet.wantsLayer = true                              // layer-backed for the state pulse
+    surface.addSubview(pet)
+
+    let titleLabel = label("", font: .systemFont(ofSize: 13, weight: .semibold),
+                           color: .labelColor, frame: .zero)
+    let subtitleLabel = label("", font: .systemFont(ofSize: 11),
+                              color: .secondaryLabelColor, frame: .zero)
+    titleLabel.isHidden = true
+    subtitleLabel.isHidden = true
+    surface.addSubview(titleLabel)
+    surface.addSubview(subtitleLabel)
+
+    panel.setFrameOrigin(PetPositionStore.load(size: tile))
+    return PetChrome(panel: panel, surface: surface, view: pet,
+                     titleLabel: titleLabel, subtitleLabel: subtitleLabel)
+}
+
+// ----------------------------------------------------------------------------
 // Modes
 // ----------------------------------------------------------------------------
 
@@ -1055,25 +1812,42 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
     if msgH > 0 { H += 9 + msgH }
     if footerH > 0 { H += 8 + footerH }
 
-    let (panel, vev) = makeCard(width: W, height: H)
+    let layout = attachSpec().map { attachLayout($0, cardW: W, cardH: H) }
+    attachCrabOnLeft = layout.map { $0.crabOnLeft }
+    let (panel, vev) = makeCard(width: W, height: H, attach: layout)
     activePanel = panel
+    // Attached cards nest all content in a body view offset past the crab icon,
+    // so the ask layout below keeps its own [0,W] coordinates — the crab is
+    // prepended, not threaded through every frame. `content` is that body (or
+    // the bare surface when unattached). Its far-edge autoresizing lets the
+    // content ride the surface's growing edge during the unfurl (see present()).
+    let content: NSView
+    if let layout {
+        let body = NSView(frame: NSRect(x: layout.crabOnLeft ? petTileSize : 0,
+                                        y: 0, width: W, height: H))
+        body.autoresizingMask = layout.crabOnLeft ? [.maxXMargin] : [.minXMargin]
+        vev.addSubview(body)
+        content = body
+    } else {
+        content = vev
+    }
     let headerBottom = H - 14 - headerH
-    vev.addSubview(chipView(x: pad, y: headerBottom + (headerH - chip) / 2, size: chip, kind: kind))
+    content.addSubview(chipView(x: pad, y: headerBottom + (headerH - chip) / 2, size: chip, kind: kind))
     if eyeH > 0 {
-        vev.addSubview(label(project, font: eyebrowFont, color: .secondaryLabelColor,
+        content.addSubview(label(project, font: eyebrowFont, color: .secondaryLabelColor,
                              frame: NSRect(x: headX, y: headerBottom + headerH - eyeH,
                                            width: headW, height: eyeH)))
-        vev.addSubview(label(title, font: titleFont, color: .labelColor,
+        content.addSubview(label(title, font: titleFont, color: .labelColor,
                              frame: NSRect(x: headX, y: headerBottom, width: headW, height: titleH)))
     } else {
-        vev.addSubview(label(title, font: titleFont, color: .labelColor,
+        content.addSubview(label(title, font: titleFont, color: .labelColor,
                              frame: NSRect(x: headX, y: headerBottom + (headerH - titleH) / 2,
                                            width: headW, height: titleH)))
     }
     if msgH > 0 {
         // full width below the header — command real estate beats strict
         // banner indentation; five mono lines at 11.5pt need every point
-        vev.addSubview(label(message, font: msgFont, color: msgColor,
+        content.addSubview(label(message, font: msgFont, color: msgColor,
                              frame: NSRect(x: pad, y: headerBottom - 9 - msgH,
                                            width: textW, height: msgH), maxLines: msgLines))
     }
@@ -1084,7 +1858,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         var yTop = (msgH > 0 ? headerBottom - 9 - msgH : headerBottom) - 12
         for r in rows {
             r.setFrameOrigin(NSPoint(x: pad, y: yTop - r.frame.height))
-            vev.addSubview(r)
+            content.addSubview(r)
             choices.append(r)
             yTop -= r.frame.height + 6
         }
@@ -1093,7 +1867,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             let fl = label(footer, font: footerFont, color: .tertiaryLabelColor,
                            frame: NSRect(x: pad, y: yTop + 6 - 8 - footerH,
                                          width: textW, height: footerH))
-            vev.addSubview(fl)
+            content.addSubview(fl)
             footerLabel = fl
         }
     } else {
@@ -1104,7 +1878,7 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
             x -= btnWidths[i]
             b.setFrameOrigin(NSPoint(x: x, y: 14))
             x -= 8
-            vev.addSubview(b)
+            content.addSubview(b)
             choices.append(b)
         }
     }
@@ -1283,7 +2057,11 @@ case "ask":   // noti-toast ask "Title" "Message" "Yes" "Always" "No"
         // falls back to the terminal
         let drain = CALayer()
         drain.anchorPoint = CGPoint(x: 0, y: 0)
-        drain.frame = CGRect(x: 0, y: 0, width: W, height: 2)
+        // On the surface layer (vev), offset to the card region when attached:
+        // vev's layer geometry places the bar at the card's BOTTOM edge, where a
+        // nested plain-NSView backing layer would flip it to the top.
+        let drainX: CGFloat = attachCrabOnLeft == true ? petTileSize : 0
+        drain.frame = CGRect(x: drainX, y: 0, width: W, height: 2)
         drain.backgroundColor = claude.withAlphaComponent(0.5).cgColor
         vev.layer?.addSublayer(drain)
         let a = CABasicAnimation(keyPath: "bounds.size.width")
@@ -1372,6 +2150,24 @@ case "summary":   // noti-toast summary "Title" "Body\nlines"
     present(panel)
     snapshotIfRequested(vev)
     _ = handler                                    // keep alive
+    app.run()
+
+case "pet":
+    let chrome = makePetPanel()
+    activePanel = chrome.panel
+    let driver = PetDriver(chrome: chrome,
+                           waitingTTL: petTimeout("NOTI_PET_WAITING_TTL", default: 120),
+                           doneTTL: petTimeout("NOTI_PET_DONE_TTL", default: 6))
+    chrome.view.onMoved = { [weak driver] in driver?.petMoved() }
+    chrome.view.onDragMove = { [weak driver] in driver?.petDragging() }
+    NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                           object: app, queue: .main) { [weak driver] _ in
+        driver?.reclamp()
+    }
+    driver.start()
+    chrome.panel.orderFrontRegardless()
+    snapshotIfRequested(chrome.surface)            // capture the whole card, not just the crab
+    _ = driver                                     // keep watcher alive
     app.run()
 
 default:

@@ -34,6 +34,17 @@ surfaces only the moments a human is actually needed:
    Claude's final message plus what it did (`ran 3 commands · edited 2 files ·
    answered 1 question`), then auto-dismisses (hover to hold it, click to
    dismiss early).
+4. **Pet** — opt-in only: `noti pet` starts a small always-on-top crab on the
+   same frosted surface as the toasts. When the pet is up, the approval prompt
+   itself grows *out of the crab*: the crab becomes the card's leading icon and
+   the interactive card unfurls from it at the pet's spot, then retracts back
+   into the crab when you answer — one object, not a toast beside a mascot. If
+   you're away and the prompt times out, the crab keeps the standing summons
+   (`Claude needs you · project`); the rest of the time it rests as just the crab
+   (running, done, or asleep). The card is still the sole decider and the sole
+   keyboard-armed surface — the pet only lends its position and its face; it
+   never answers prompts and never captures the keyboard. Set
+   `pet.attach_prompts: false` to keep the crab but route prompts to the corner.
 
 Concurrent toasts (several sessions, an approval plus a summary) stack in one
 packed column and re-pack smoothly as cards dismiss.
@@ -87,6 +98,7 @@ PreToolUse hook ──▶ noti policy ──┬─ read-only / safe / already-al
                                     multi-select: heads-up toast, answer in terminal)
                  ExitPlanMode ────▶ Approve ─▶ allow  ·  View/timeout ─▶ terminal plan UI
 Stop hook ──────▶ trimmed last message + tool tally ─▶ non-blocking summary toast
+Optional pet ───▶ best-effort state files ───────────▶ non-capturing floating companion
 ```
 
 The UI is a single-file borderless `NSPanel` Swift binary (`bin/noti-toast.swift`)
@@ -118,6 +130,11 @@ git clone https://github.com/mjbarefo/noti && cd noti
 ./noti install                 # everywhere
 ./noti install --project .     # this project only
 ./noti uninstall               # remove
+
+# opt into the floating companion:
+# set pet.enabled: true in config, then run:
+./noti pet
+./noti pet --stop
 ```
 
 After installing, start a fresh `claude` session for the hooks to load.
@@ -164,6 +181,10 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `approval.bash_always_mode` | `exact` | `exact` = "Always" rule matches only this command (safe); `prefix` = broader |
 | `approval.rule_scope` | `project_local` | where "Always" writes rules: `project_local` / `project` / `global` |
 | `summary.show_tally` | `true` | append `ran N commands · edited M files` |
+| `pet.enabled` | `false` | opt into hook state-file writes and `noti pet` |
+| `pet.state_dir` | `~/.config/noti/pet` | per-session pet state files |
+| `pet.done_decay_seconds` | `6` | how long done/failed poses linger before asleep |
+| `pet.attach_prompts` | `true` | when the pet is running, grow the prompt out of the crab (else corner toast) |
 
 ## Safety notes
 
@@ -244,6 +265,14 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   appearing while you type — even directly under a parked cursor — can never
   swallow an in-flight "y" and approve something you didn't read. Set
   `toast.hotkeys: false` to go back to click-only.
+- **The pet is a reader, not a decider.** When `pet.enabled` is true, hooks make
+  best-effort writes to per-session state files; a failed write is swallowed and
+  can never delay or change a permission decision. The pet panel is
+  non-activating, cannot become key, and never installs a key monitor. Attaching
+  a prompt to the pet does not change this: the interactive card that grows out
+  of the crab is the ordinary approval toast — the sole decider and the sole
+  keyboard-armed surface — just positioned over the pet and drawing the same
+  crab. The pet only publishes where it sits; the toast reads that and decides.
 - "Always" writes the **exact** command/path/domain, never a broadened glob, and
   refuses to write if your settings file is unparseable (it never clobbers it; it
   keeps a `.noti-prev` copy). Commands ending in `*` are never minted at all —

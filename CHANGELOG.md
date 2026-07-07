@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Opt-in pet companion.** `noti pet` starts a small non-activating floating
+  crab that watches best-effort per-session state files. It shares the toasts'
+  frosted surface and *is* the delivery: on a summons it unfurls one card out of
+  the crab (`Claude needs you · project`), and collapses back to just the crab
+  when running, done, or asleep — never becoming a second decider. Hook writes
+  are gated by `pet.enabled: false` by default; failures are debug-only and never
+  affect permission decisions. `noti uninstall` also stops a running pet.
+- **Prompts delivered through the pet.** When the pet is running, the interactive
+  approval/question/plan toast now grows *out of the crab* at the pet's spot —
+  the same crab becomes the card's leading icon and the card unfurls from it,
+  then retracts back into it when you answer — instead of a separate corner toast
+  beside a decorative pet card. It is still the one decider and the one
+  keyboard-armed surface (the pet only lends its position and its face); the pet
+  republishes its live position in an `.anchor` file so the card lands exactly on
+  it. New `pet.attach_prompts` (default `true`) is the kill-switch back to
+  corner toasts. Off (pet disabled), nothing changes.
+
 ### Changed
 - **Toast motion, refined end to end.** Cards now arrive the way system
   banners do — a fade plus a short slide in from the corner's screen edge —

@@ -7,6 +7,8 @@ REUSABLE PRIMITIVES (any script/agent can call these):
         exit code is the button index (0-based), or 124 on timeout.
     noti notify --title T --body B
         Shows a non-blocking summary toast that auto-dismisses. Returns at once.
+    noti pet
+        Starts the opt-in floating companion (requires pet.enabled: true).
 
 CLAUDE CODE HOOK ADAPTER (wired up by `noti install`):
     noti hook pretooluse   # reads PreToolUse JSON on stdin -> permission decision
@@ -32,6 +34,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -54,6 +57,8 @@ SWIFT_SRC = HERE / "bin" / "noti-toast.swift"
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "noti"
 SLOT_DIR = CONFIG_HOME / "slots"
 TALLY_DIR = CONFIG_HOME / "tally"
+PET_DIR = CONFIG_HOME / "pet"
+PET_PID_FILE = CONFIG_HOME / "pet.pid"
 LOG_FILE = CONFIG_HOME / "noti.log"
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -122,6 +127,25 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "max_chars": 240,
         "show_tally": True,
+    },
+    "pet": {
+        # OFF by default because the pet is the charter carve-out: it includes
+        # calm running/asleep presence so the standing summons has somewhere to
+        # stand. Users must opt into both the long-lived surface and hook state
+        # writes.
+        "enabled": False,
+        "state_dir": str(PET_DIR),
+        # done/failed are acknowledgments, not standing summonses; they decay
+        # quickly to asleep. waiting uses ask_timeout+30 instead, so a terminal
+        # fallback has the same natural bound as the blocked hook.
+        "done_decay_seconds": 6,
+        # When the pet is running, deliver the approval/question/plan toast AS
+        # the pet: the interactive card unfurls out of the crab at its spot and
+        # occludes it, instead of a separate corner toast plus a decorative pet
+        # card. The card is still the sole decider (R1) and sole keyboard surface
+        # (R3) — the pet only lends its position and its face. R7 kill-switch:
+        # set false to keep the crab and route prompts to the corner as before.
+        "attach_prompts": True,
     },
 }
 
@@ -227,7 +251,8 @@ RC_OTHER = 10
 
 def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
                kind: str = "", project: str = "", footer: str = "",
-               options=None, descs=None, other: bool = False) -> dict:
+               options=None, descs=None, other: bool = False,
+               attach: bool = False, pet_dir=None) -> dict:
     env = dict(os.environ)
     # Scrub BEFORE conditionally setting: dict(os.environ) inherits the parent
     # env, and a stray exported NOTI_OPTIONS would flip a permission prompt
@@ -236,6 +261,11 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
     env.pop("NOTI_OPTIONS", None)
     env.pop("NOTI_DESCS", None)
     env.pop("NOTI_OTHER", None)
+    # Same scrub rationale for the pet-attach pair: a stray inherited NOTI_ATTACH
+    # must never make a toast chase a (possibly stale) .anchor when this call did
+    # not opt in. Set them below only when the caller asked to attach.
+    env.pop("NOTI_ATTACH", None)
+    env.pop("NOTI_PET_STATE_DIR", None)
     if options:
         # full option labels for the vertical list layout; argv still carries
         # the truncated fallbacks so a stale binary renders the classic card
@@ -255,6 +285,14 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
         # lets the toast publish its height, heartbeat its claim, and re-pack
         # the column when a neighbour dismisses
         env["NOTI_SLOT_DIR"] = str(SLOT_DIR)
+    if attach:
+        # Grow out of the pet instead of the corner. The toast reads the pet's
+        # live crab origin from <pet_dir>/.anchor. Attached callers pass slot=None
+        # (no corner column — the pet's spot is the position), so NOTI_SLOT_DIR
+        # is absent above and the toast takes its makeCard attach branch.
+        env["NOTI_ATTACH"] = "1"
+        if pet_dir:
+            env["NOTI_PET_STATE_DIR"] = str(pet_dir)
     if kind:
         env["NOTI_KIND"] = kind        # tints the icon chip; mono message
     if project:
@@ -266,7 +304,7 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
 
 def toast_ask(title, message, buttons, timeout, corner, slot, hotkeys=True,
               kind="", project="", options=None, descriptions=None, footer="",
-              other=False):
+              other=False, attach=False, pet_dir=None):
     """Blocking. Returns (returncode, text). returncode 124 == timed out.
     text is display copy (the clicked label) — EXCEPT when returncode ==
     RC_OTHER, where it is the user's typed free-text answer and stdout is
@@ -282,7 +320,8 @@ def toast_ask(title, message, buttons, timeout, corner, slot, hotkeys=True,
         # except: no decision, terminal asks. Fail-open beats silent mangling.
         capture_output=True, text=True, encoding="utf-8",
         env=_toast_env(timeout, slot, corner, hotkeys, kind, project, footer,
-                       options=options, descs=descriptions, other=other),
+                       options=options, descs=descriptions, other=other,
+                       attach=attach, pet_dir=pet_dir),
     )
     # .strip() is a DECLARED canonicalization of the one load-bearing stdout
     # path (rc == RC_OTHER): the framing "\n" must go, outer whitespace is
@@ -310,6 +349,38 @@ def toast_summary(title, body, timeout, corner, kind="note", footer=""):
     except Exception:
         release_slot(slot)
         raise
+
+
+def launch_pet(cfg: dict) -> int:
+    """Start the long-lived pet reader detached from this shell."""
+    if not BINARY.exists():
+        raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
+    env = dict(os.environ)
+    env["NOTI_PET_STATE_DIR"] = str(pet_state_dir(cfg))
+    env["NOTI_PET_WAITING_TTL"] = str(int(cfg["toast"]["ask_timeout_seconds"]) + 30)
+    env["NOTI_PET_DONE_TTL"] = str((cfg.get("pet") or {}).get("done_decay_seconds", 6))
+    env["NOTI_CORNER"] = cfg["toast"]["corner"]
+    proc = subprocess.Popen(
+        [str(BINARY), "pet"],
+        env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    PET_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PET_PID_FILE.write_text(str(proc.pid))
+    # Unlike a fire-and-forget summary toast, the pet is long-lived and its
+    # launch is worth confirming. The likeliest instant death is a working copy
+    # whose binary predates pet mode ("unknown mode: pet" -> exit 64, swallowed
+    # by DEVNULL); without this the CLI would falsely report success and leave a
+    # dead pid behind.
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        with contextlib.suppress(Exception):
+            PET_PID_FILE.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"pet exited immediately (code {proc.returncode}); "
+            "run `noti build` if the binary predates pet mode")
+    return proc.pid
 
 
 def acquire_slot(max_slots: int = 8) -> int:
@@ -345,6 +416,161 @@ def release_slot(i) -> None:
         (SLOT_DIR / f"slot-{i}").unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def pet_state_dir(cfg: dict) -> Path:
+    raw = ((cfg.get("pet") or {}).get("state_dir") or str(PET_DIR))
+    return Path(os.path.expanduser(str(raw)))
+
+
+def _safe_sid(sid) -> str:
+    """Reduce a session id to a boring filename stem that can't escape its state
+    dir. session_id arrives from semi-trusted hook payloads (Claude-controlled)
+    and may carry path separators or control bytes; without this a crafted id
+    like "../../../.claude/settings" would let an atomic write clobber (or a
+    sweep unlink) an arbitrary .json outside the intended dir."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(sid)).strip("._")[:120] or "default"
+
+
+def pet_session_path(payload: dict, cfg: dict) -> Path:
+    sid = payload.get("session_id") or "default"
+    return pet_state_dir(cfg) / f"{_safe_sid(sid)}.json"
+
+
+def pet_record(payload: dict, cfg: dict, state: str) -> None:
+    """Best-effort pet state publish. Hook correctness never depends on this."""
+    try:
+        if not isinstance(payload, dict):
+            return
+        pcfg = cfg.get("pet") or {}
+        if not pcfg.get("enabled", False):
+            return
+        cwd = str(payload.get("cwd") or "")
+        project = os.path.basename(cwd.rstrip("/")) or "Claude Code"
+        path = pet_session_path(payload, cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, {
+            "state": state,
+            "session_id": str(payload.get("session_id") or "default"),
+            "project": project,
+            "cwd": cwd,
+            "updated_at": time.time(),
+        })
+    except Exception as e:
+        debug(f"pet state write failed: {e}")
+
+
+def _attach_prompts(cfg: dict) -> bool:
+    """True when a running pet should HOST the interactive prompt — the card
+    grows out of the crab at its spot instead of a separate corner toast. Gated
+    on the pet being opt-in-enabled, the attach kill-switch, and a *verified-live*
+    pet process: a stale pid must fall back to the corner, never leave a prompt
+    attached to a crab that is not on screen. Cheap and fail-safe — any failure
+    (including no pet) yields False, i.e. the unchanged corner toast."""
+    try:
+        pcfg = cfg.get("pet") or {}
+        if not (pcfg.get("enabled", False) and pcfg.get("attach_prompts", True)):
+            return False
+        return pet_is_running() is not None
+    except Exception as e:
+        debug(f"attach check failed: {e}")
+        return False
+
+
+def pet_clear(cfg: dict) -> None:
+    try:
+        for p in pet_state_dir(cfg).glob("*.json"):
+            p.unlink(missing_ok=True)
+    except Exception as e:
+        debug(f"pet state clear failed: {e}")
+
+
+def pet_sweep(cfg: dict) -> None:
+    """Reap state files from sessions that ended long ago. Runs at Stop, the
+    same cadence as the tally sweep. Nothing re-touches a live session's file,
+    so an age cutoff can never reap an active session — a genuinely long
+    `running` build re-stamps its file on its next hook. Without this, hook_stop
+    writes one `done` file per session id that would otherwise live forever."""
+    try:
+        if not (cfg.get("pet") or {}).get("enabled", False):
+            return
+        cutoff = time.time() - 48 * 3600
+        for p in pet_state_dir(cfg).glob("*.json"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as e:
+        debug(f"pet sweep failed: {e}")
+
+
+def pet_pid_command(pid: int) -> str | None:
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                           capture_output=True, text=True, timeout=2)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception as e:
+        debug(f"pet pid check failed: {e}")
+        return None
+
+
+def pet_is_running() -> int | None:
+    """The pid of a verified-live `noti pet`, else None. Exact-matches the
+    command line launch_pet spawns so a reused pid (the pid file survives pet
+    crashes and reboots) can't be mistaken for our pet."""
+    try:
+        pid = int(PET_PID_FILE.read_text().strip())
+    except Exception:
+        return None
+    cmd = pet_pid_command(pid)
+    return pid if cmd == f"{BINARY} pet" else None
+
+
+def stop_pet(cfg: dict, quiet: bool = False) -> int:
+    try:
+        pid = int(PET_PID_FILE.read_text().strip())
+    except Exception:
+        if not quiet:
+            print("noti pet is not running")
+        return 0
+    cmd = pet_pid_command(pid)
+    if cmd is None:
+        # ps itself failed — we can't tell whether the pid is our pet, so leave
+        # both the process and its pid file alone rather than risk a stray kill.
+        if not quiet:
+            print("noti: could not verify pet process; leaving it running", file=sys.stderr)
+        return 1
+    # Exact match, not substring: a reused pid whose argv merely contains
+    # "noti-toast" and " pet" (e.g. an editor open on the sources) must not be
+    # SIGTERMed. launch_pet runs exactly `[str(BINARY), "pet"]`.
+    if cmd != f"{BINARY} pet":
+        with contextlib.suppress(Exception):
+            PET_PID_FILE.unlink(missing_ok=True)
+        if not quiet:
+            print("noti pet was not running")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if not quiet:
+            print("noti pet was not running")
+    except Exception as e:
+        # The process is verified ours but the kill failed (e.g. EPERM). Keep the
+        # pid file so the pet stays trackable, and report failure regardless of
+        # quiet — cmd_uninstall must not claim success over a still-running pet.
+        if not quiet:
+            print(f"noti: could not stop pet: {e}", file=sys.stderr)
+        return 1
+    else:
+        if not quiet:
+            print(f"stopped noti pet (pid {pid})")
+    with contextlib.suppress(Exception):
+        PET_PID_FILE.unlink(missing_ok=True)
+    # The pet is gone; its state files are now unread. Clear them so a later
+    # re-summon starts clean instead of resurrecting stale session poses.
+    pet_clear(cfg)
+    return 0
 
 # ---------------------------------------------------------------------------
 # permission rules: matching + minting (must round-trip with each other)
@@ -785,7 +1011,7 @@ def tally_record(payload: dict) -> None:
     tool = payload.get("tool_name", "")
     tinput = payload.get("tool_input", {}) or {}
     sid = payload.get("session_id", "default")
-    path = TALLY_DIR / f"{sid}.json"
+    path = TALLY_DIR / f"{_safe_sid(sid)}.json"
     with locked("tally.lock"):
         data = read_json(path, {}) or {}
         data.setdefault("bash", 0)
@@ -814,7 +1040,7 @@ def tally_record(payload: dict) -> None:
 
 
 def tally_read_and_clear(sid: str):
-    path = TALLY_DIR / f"{sid}.json"
+    path = TALLY_DIR / f"{_safe_sid(sid)}.json"
     with locked("tally.lock"):
         data = read_json(path, None)
         try:
@@ -939,7 +1165,8 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
     deadline = time.monotonic() + max(float(cfg["toast"]["ask_timeout_seconds"]), 4.0)
     allow_other = bool(cfg["approval"].get("question_other", True))
     answers = {}
-    slot = acquire_slot()
+    attach = _attach_prompts(cfg)
+    slot = None if attach else acquire_slot()
     try:
         for i, item in enumerate(items):
             remaining = deadline - time.monotonic()
@@ -957,7 +1184,9 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
                                   # terminal escape hatch
                                   options=item["options"], descriptions=item["descriptions"],
                                   other=allow_other,
-                                  footer="esc · answer in terminal")
+                                  footer="esc · answer in terminal",
+                                  attach=attach,
+                                  pet_dir=pet_state_dir(cfg) if attach else None)
             if 0 <= rc < len(item["options"]):
                 answers[item["question"]] = item["options"][rc]  # index -> EXACT raw label
             elif rc == RC_OTHER and allow_other:
@@ -980,11 +1209,13 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
                 answers[item["question"]] = typed
             else:
                 return 0    # esc / timeout / junk rc / sentinel-without-opt-in
-            if i < n - 1:
+            if i < n - 1 and slot is not None:
                 # the card's own atexit deleted the slot file; re-claim the
                 # slot before the next card spawns, or a concurrent session
                 # slides into the gap (two cards overlaying at one position)
-                # and the release below would unlink THEIR live claim
+                # and the release below would unlink THEIR live claim.
+                # Attached cards (slot is None) grow from the pet, not the
+                # column, so there is no slot file to re-touch.
                 try:
                     (SLOT_DIR / f"slot-{slot}").touch()
                 except Exception:
@@ -993,10 +1224,12 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
         debug(f"question toast failed: {e}")
         return 0
     finally:
-        release_slot(slot)
+        if slot is not None:
+            release_slot(slot)
     tinput = dict(payload.get("tool_input") or {})
     tinput["answers"] = answers
     tally_record(payload)
+    pet_record(payload, cfg, "running")
     emit_pretool("allow", "noti: question answered from toast", updated_input=tinput)
     return 0
 
@@ -1006,19 +1239,23 @@ def prompt_plan(payload: dict, cfg: dict, d: dict) -> int:
     implementation edits/commands still go through noti's approval toasts).
     View / Esc / timeout emits NO decision — the terminal's plan UI, which can
     actually show the whole plan and take feedback, handles it."""
-    slot = acquire_slot()
+    attach = _attach_prompts(cfg)
+    slot = None if attach else acquire_slot()
     try:
         rc, _ = toast_ask(d["title"], d["message"], ["Approve", "View"],
                           cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
                           hotkeys=bool(cfg["toast"].get("hotkeys", True)),
-                          kind="plan", project=d.get("project", ""))
+                          kind="plan", project=d.get("project", ""),
+                          attach=attach, pet_dir=pet_state_dir(cfg) if attach else None)
     except Exception as e:
         debug(f"plan toast failed: {e}")
         return 0
     finally:
-        release_slot(slot)
+        if slot is not None:
+            release_slot(slot)
     if rc == 0:
         tally_record(payload)
+        pet_record(payload, cfg, "running")
         emit_pretool("allow", "noti: plan approved from toast")
     return 0
 
@@ -1028,6 +1265,7 @@ def hook_pretooluse(payload: dict) -> int:
     d = evaluate(payload, cfg)
     action = d["action"]
     debug(f"pretooluse {payload.get('tool_name')} -> {action} ({d.get('reason','')})")
+    pet_record(payload, cfg, "waiting" if action in ("prompt", "question", "plan", "notice") else "running")
 
     if action == "defer":
         return 0                                  # exit 0, no JSON
@@ -1061,23 +1299,30 @@ def hook_pretooluse(payload: dict) -> int:
     # two-button card needs no exit-code remapping.
     mintable = make_rule(payload.get("tool_name", ""),
                          payload.get("tool_input", {}) or {}, cfg) is not None
-    slot = acquire_slot()
+    # Attached prompts grow out of the pet at its spot; unattached ones join the
+    # corner column. Only the corner path needs a slot (attached cards don't
+    # stack there), so acquire one only when not attaching.
+    attach = _attach_prompts(cfg)
+    slot = None if attach else acquire_slot()
     try:
         rc, label = toast_ask(d["title"], d["message"],
                               ["Yes", "Always", "No"] if mintable else ["Yes", "No"],
                               cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
                               hotkeys=bool(cfg["toast"].get("hotkeys", True)),
-                              kind=d.get("kind", ""), project=d.get("project", ""))
+                              kind=d.get("kind", ""), project=d.get("project", ""),
+                              attach=attach, pet_dir=pet_state_dir(cfg) if attach else None)
     except Exception as e:
         debug(f"toast failed: {e}")
         emit_pretool("ask", "noti: toast unavailable, asking in terminal")
         return 0
     finally:
-        release_slot(slot)
+        if slot is not None:
+            release_slot(slot)
 
     choice = label.lower()
     if choice == "yes":
         tally_record(payload)
+        pet_record(payload, cfg, "running")
         emit_pretool("allow", "noti: approved")
     elif choice == "always":
         rule = make_rule(payload.get("tool_name", ""), payload.get("tool_input", {}) or {}, cfg)
@@ -1087,8 +1332,10 @@ def hook_pretooluse(payload: dict) -> int:
             except Exception as e:
                 debug(f"write_rule failed: {e}")
         tally_record(payload)
+        pet_record(payload, cfg, "running")
         emit_pretool("allow", f"noti: always-allowed [{rule}]" if rule else "noti: approved")
     elif choice == "no":
+        pet_record(payload, cfg, "running")
         emit_pretool("deny", "noti: denied by user")
     else:
         # rc 124 (timeout) or dismissed -> hand back to Claude's terminal prompt
@@ -1130,6 +1377,8 @@ def write_rule(rule: str, payload: dict, cfg: dict) -> None:
 
 def hook_stop(payload: dict) -> int:
     cfg = load_config()
+    pet_record(payload, cfg, "done")
+    pet_sweep(cfg)                                 # reap long-dead session files
     if not cfg["summary"]["enabled"]:
         return 0
     msg = payload.get("last_assistant_message") \
@@ -1180,6 +1429,29 @@ def cmd_notify(a) -> int:
     except FileNotFoundError as e:
         print(f"noti: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_pet(a) -> int:
+    cfg = load_config()
+    if a.stop:
+        return stop_pet(cfg)
+    if not (cfg.get("pet") or {}).get("enabled", False):
+        print("noti pet is disabled; set pet.enabled: true in config to opt in.", file=sys.stderr)
+        return 1
+    # One critter, one question: refuse a second launch instead of orphaning the
+    # first (its pid file would be clobbered, leaving it unreachable from --stop
+    # and uninstall while a duplicate stacks pixel-perfectly on the same corner).
+    running = pet_is_running()
+    if running is not None:
+        print(f"noti pet is already running (pid {running})")
+        return 0
+    try:
+        pid = launch_pet(cfg)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"noti: {e}", file=sys.stderr)
+        return 1
+    print(f"noti pet started (pid {pid})")
     return 0
 
 
@@ -1340,6 +1612,12 @@ def cmd_install(a) -> int:
 
 
 def cmd_uninstall(a) -> int:
+    # The pet is a single machine-wide companion, not a per-project surface — a
+    # `--project` uninstall removes only that project's hooks and must leave a
+    # pet that is still serving every other session alone. Only a global
+    # uninstall ("killed by noti uninstall") stops it.
+    if not a.project:
+        stop_pet(load_config(), quiet=True)
     target = (Path(a.project).resolve() / ".claude" / "settings.json") if a.project \
         else Path.home() / ".claude" / "settings.json"
     data = read_json(target, None)
@@ -1486,6 +1764,10 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--kind", default="note", help="icon chip: run|edit|fetch|mcp|note|question|plan")
     n.add_argument("--footer", default="", help="small monospaced footer line")
     n.set_defaults(fn=cmd_notify)
+
+    pet = sub.add_parser("pet", help="start the opt-in floating companion")
+    pet.add_argument("--stop", action="store_true", help="stop the running pet")
+    pet.set_defaults(fn=cmd_pet)
 
     h = sub.add_parser("hook", help="Claude Code hook adapter (reads JSON on stdin)")
     h.add_argument("event", choices=["pretooluse", "stop"])

@@ -14,6 +14,9 @@ noti surfaces **only the moments a human is actually needed** and stays silent
 otherwise. Every candidate feature is judged by one question: *does this
 summon a human who is required, or does it narrate work that is going fine?*
 Narration fails the test, always.
+One opt-in ambient surface may exist so the summons has somewhere to stand;
+everything it shows outside the summons stays inert — no counts, no progress,
+no lists.
 
 Explicit non-goals, so they don't creep back in:
 
@@ -203,7 +206,9 @@ these govern growth.
 | P2 | Doctor: managed-settings warning | Promote the README known-limitation: if `/Library/Application Support/ClaudeCode/managed-settings.json` exists, warn that its deny rules are invisible to noti and suggest emptying `bash_safe_commands`. Read-only check, zero-dep. |
 | P2 | Doctor: hook-coverage drift | Compare installed event set against this version's shipped set; "install predates `<event>` — `noti uninstall && noti install`". R6's enforcement arm. |
 | P2 | Opt-in per-toast sound | Accessibility: `toast.sound` (default false). NSSound is AppKit — zero-dep holds. Distinct (or no) sound for summary vs ask, so ask stays salient. |
-| P2 | The pet — a standing summons | Opt-in ambient companion; big enough to earn its own section below. |
+| shipped 2026-07-07 | The pet — a standing summons | Opt-in ambient companion: one non-capturing state-file reader, never a toast suppressor. |
+| shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its crab, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
+| P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the crab using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
 | P3 | Document `--kind error` | Falls out of StopFailure; README only. |
 
 ## The pet — a standing summons (design)
@@ -229,12 +234,48 @@ ship. It remains NOT the rejected dashboard: one critter, one question.
 Sketch (all of it gated on a `docs/spikes/` spike first):
 
 - **Surface**: a new `pet` mode of the toast binary — same `.accessory` /
-  non-activating / all-Spaces NSPanel DNA as the cards. Small (~64pt),
-  draggable, remembers its corner (re-clamped on
-  `didChangeScreenParametersNotification` — an undock must not park it
-  off-screen). Never the key window (R3), never emits anything (R1).
-  Suggested default character: a little terracotta crab — the identity color
-  already means "Claude wants me" from across the room.
+  non-activating / all-Spaces NSPanel DNA as the cards, and the *same frosted
+  `.popover` surface* (`makeCard`'s material, 16pt continuous corner, hairline
+  border) so the pet reads as a member of the toast family, not a separate app
+  icon. Small (72pt crab) at rest; draggable, remembers its corner (re-clamped
+  on `didChangeScreenParametersNotification` — an undock must not park it
+  off-screen). Never the key window (R3), never emits anything (R1). Default
+  character: a little terracotta crab — the identity color already means
+  "Claude wants me" from across the room.
+- **Singular delivery**: the pet *is* the notification surface, not a mascot
+  beside one. Two things unfurl out of the crab, and neither is a second
+  decider (R5):
+  1. **The live prompt (as built, `pet.attach_prompts`).** When the pet is
+     running, `hook_pretooluse` (and the question/plan paths) spawn the *ordinary
+     ask toast* in **attached** mode instead of at the corner: the toast wears
+     the same crab as its leading icon, sits so that crab tile lands exactly on
+     the pet's anchor, and — being at least as tall and wide as the 72pt pet tile
+     — fully **occludes** the resting pet beneath it. The card grows into the
+     screen room the anchor leaves: horizontally away from the nearer edge, and
+     vertically up *or* down (the crab rides the card's top edge at a top-corner
+     pet, its bottom edge at a bottom-corner pet) so a tall multi-option question
+     never centres itself off the screen. A final clamp keeps the whole card in
+     the visible frame even on a small display — trading a few px of crab drift
+     (a faint pet ghost) for a card that is always fully visible and answerable. The interactive card unfurls
+     horizontally out of the crab and retracts back into it on answer, revealing
+     the pet again (now in its post-answer mood) with no handoff seam. This keeps
+     R1/R3 intact by construction: the attached card is still the same
+     hook-spawned decider process and the only keyboard-armed surface — the pet
+     process lends only its position (published live in an `.anchor` file the
+     toast reads) and its face. No coordination marker is needed: occlusion, not
+     a hide/show dance, is what makes it read as one object. The pet skips the
+     corner slot column when attached; a *second* concurrent attached prompt
+     overlaps at the same spot (top-answerable first) — the documented edge,
+     acceptable because the standing pet still counts all waiting sessions and
+     simultaneous prompts-with-a-present-human are rare. Kill-switch back to
+     corner toasts: `pet.attach_prompts: false` (R7).
+  2. **The standing summons (post-timeout).** If the human is away and the
+     attached prompt times out, the crab keeps the glanceable `Claude needs you ·
+     <project>` (or `· N sessions`) card — the pet's own decorative unfurl, which
+     is what the toast was occluding. This is the whole point: a toast is a knock
+     you can miss; the pet is its standing form. The card grows into whichever
+     side has room so the crab never leaves its corner. Approve/deny still
+     happens on a toast or in the terminal — the pet only stands there asking.
 - **State feed**: the pet is a long-lived *reader*, never in any hook path.
   Hooks drop per-session, event-stamped state files (`waiting` / `running` /
   `done` / `failed`) into a state dir; the pet kqueue-watches it (the slot
@@ -248,14 +289,16 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   only at the session's next PreToolUse/Stop — self-healing, but late. Hook
   writes are best-effort: a failed write degrades to a wrong-mood pet, never
   a blocked session.
-- **States**: *waiting on you* (animated, project name shown — the whole
-  point) · *running* (calm idle) · *done* (brief acknowledgment, then rest)
-  · *turn failed* (alarmed, pairs with StopFailure) · *no sessions* (asleep).
-  Every state keeps a distinct static pose so reduce-motion loses the
-  animation, never the meaning. Click shows noti's own mini card naming the
-  waiting session(s) — focusing the right terminal window is a spike
-  question (hook payloads carry only `cwd`, ambiguous across tabs and
-  unresolvable over ssh/tmux), not a promise.
+- **States**: *waiting on you* (the live attached prompt is unfurled out of the
+  crab and occluding the pet; once it times out, the pet's own `Claude needs you`
+  card stands in its place, project/count named — the whole point) · *running*
+  (calm resting crab, no words) · *done* (brief ✓, then rest) · *turn failed*
+  (alarmed, presents a card, pairs with StopFailure) · *no sessions* (asleep).
+  Only a summons (`waiting`/`failed`) presents the card; every resting state
+  stays inert — no counts, no project names — per the charter carve-out. Each state keeps a distinct static crab pose so
+  reduce-motion loses only the unfurl, never the meaning. Focusing the right
+  terminal window on click is still a spike question (hook payloads carry only
+  `cwd`, ambiguous across tabs and unresolvable over ssh/tmux), not a promise.
 - **Personality without a pipeline**: frames are embedded sprite data
   (zero-dep holds); `pet.sprite` may point at a user-supplied sprite-sheet
   PNG — validated on load, silent fallback to the embedded default —

@@ -497,7 +497,7 @@ want("junk rc with stdout -> no decision", _run_prompt(7, "ghost")[0].strip() ==
 want("rc=124 with dirty stdout -> no decision",
      _run_prompt(124, "ghost")[0].strip() == "")
 want("rc=64 with dirty stdout -> no decision",
-     _run_prompt(64, "usage: noti-toast ask|summary ...")[0].strip() == "")
+     _run_prompt(64, "usage: noti-toast ask|summary|pet ...")[0].strip() == "")
 # display copy must never be the answer on the index path
 want("option rc answers from the LIST, never stdout",
      _answers(_run_prompt(0, "Mangled Display Label")[0]) == {"Pick one?": "Alpha"})
@@ -567,6 +567,299 @@ try:
                      "cwd": CWD}, cfg)["action"] == "allow")
 finally:
     m.load_patterns = _save2
+
+# Pet state is opt-in and must stay fail-open: disabled config writes nothing;
+# enabled hooks publish tiny per-session files without changing the decision
+# path. The prompt case fakes a timeout so no GUI launches and the standing
+# summons intentionally remains waiting for the terminal fallback.
+pet_dir = tempfile.mkdtemp()
+pet_payload = {"tool_name": "Bash", "tool_input": {"command": "git status"},
+               "permission_mode": "default", "cwd": CWD, "session_id": "pet/safe"}
+pet_off = copy.deepcopy(cfg)
+pet_off["pet"]["enabled"] = False
+pet_off["pet"]["state_dir"] = pet_dir
+m.pet_record(pet_payload, pet_off, "waiting")
+want("pet.enabled=False writes no state", not os.listdir(pet_dir))
+
+pet_on = copy.deepcopy(cfg)
+pet_on["pet"]["enabled"] = True
+pet_on["pet"]["state_dir"] = pet_dir
+m.pet_record(pet_payload, pet_on, "waiting")
+pet_files = os.listdir(pet_dir)
+pet_data = json.load(open(os.path.join(pet_dir, pet_files[0])))
+want("pet state file is sanitized JSON",
+     pet_files == ["pet_safe.json"] and pet_data["state"] == "waiting"
+     and pet_data["project"] == os.path.basename(CWD))
+
+hook_dir = tempfile.mkdtemp()
+hook_cfg = copy.deepcopy(cfg)
+hook_cfg["pet"]["enabled"] = True
+hook_cfg["pet"]["state_dir"] = hook_dir
+_load_config, _toast_ask, _acquire_slot, _release_slot = (
+    m.load_config, m.toast_ask, m.acquire_slot, m.release_slot)
+try:
+    m.load_config = lambda: hook_cfg
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.hook_pretooluse(pet_payload)
+    hook_state = json.load(open(os.path.join(hook_dir, "pet_safe.json")))
+    want("safe pretool writes running pet state",
+         rc == 0 and hook_state["state"] == "running"
+         and json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "allow")
+
+    m.toast_ask = lambda *a, **kw: (124, "")
+    m.acquire_slot = lambda *a, **kw: 0
+    m.release_slot = lambda *a, **kw: None
+    wait_payload = {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"},
+                    "permission_mode": "default", "cwd": CWD, "session_id": "pet-wait"}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.hook_pretooluse(wait_payload)
+    wait_state = json.load(open(os.path.join(hook_dir, "pet-wait.json")))
+    want("prompt fallback leaves pet waiting",
+         rc == 0 and wait_state["state"] == "waiting"
+         and json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "ask")
+finally:
+    m.load_config, m.toast_ask, m.acquire_slot, m.release_slot = (
+        _load_config, _toast_ask, _acquire_slot, _release_slot)
+
+# Pet-attached prompts: when a live pet hosts the toast, the interactive card
+# grows out of the crab instead of a separate corner toast. The gate is
+# opt-in-enabled + kill-switch + a VERIFIED-LIVE pet; anything else must fall
+# back to the corner (never attach a prompt to a crab that isn't on screen).
+_pir = m.pet_is_running
+try:
+    attach_cfg = copy.deepcopy(cfg)
+    attach_cfg["pet"]["enabled"] = True
+    attach_cfg["pet"]["attach_prompts"] = True
+    m.pet_is_running = lambda: 4321
+    want("attach when pet enabled, switch on, and running",
+         m._attach_prompts(attach_cfg) is True)
+    m.pet_is_running = lambda: None
+    want("no attach when the pet pid is not verified-live",
+         m._attach_prompts(attach_cfg) is False)
+    m.pet_is_running = lambda: 4321
+    off_switch = copy.deepcopy(attach_cfg)
+    off_switch["pet"]["attach_prompts"] = False
+    want("no attach when the attach kill-switch is off",
+         m._attach_prompts(off_switch) is False)
+    disabled = copy.deepcopy(cfg)
+    disabled["pet"]["enabled"] = False
+    want("no attach when the pet is disabled", m._attach_prompts(disabled) is False)
+finally:
+    m.pet_is_running = _pir
+
+# The attach env pair: NOTI_ATTACH + the pet dir it reads .anchor from, and NO
+# corner slot dir (attached cards don't stack in the column). A stray inherited
+# NOTI_ATTACH is scrubbed unless THIS call opted in — same discipline as the
+# NOTI_OPTIONS/NOTI_OTHER scrubs, so an export can't force-attach a toast.
+env_a = m._toast_env(90, None, "top-right", attach=True, pet_dir="/tmp/petdir")
+want("attach env sets NOTI_ATTACH + pet dir, no corner slot dir",
+     env_a.get("NOTI_ATTACH") == "1" and env_a.get("NOTI_PET_STATE_DIR") == "/tmp/petdir"
+     and "NOTI_SLOT_DIR" not in env_a)
+want("unattached env carries no NOTI_ATTACH",
+     "NOTI_ATTACH" not in m._toast_env(90, None, "top-right"))
+os.environ["NOTI_ATTACH"] = "1"
+try:
+    want("stray inherited NOTI_ATTACH is scrubbed when not attaching",
+         "NOTI_ATTACH" not in m._toast_env(90, None, "top-right", attach=False))
+finally:
+    os.environ.pop("NOTI_ATTACH", None)
+
+# The prompt path honors attach: it must pass attach=True + a pet_dir, hand the
+# toast slot=None, and NOT acquire a corner slot (the pet's spot is the position).
+_attach_o, _toast_o, _acq_o, _rel_o, _lc_o = (
+    m._attach_prompts, m.toast_ask, m.acquire_slot, m.release_slot, m.load_config)
+seen = {}
+acq_calls = []
+def _cap_toast(*a, **kw):
+    seen["attach"] = kw.get("attach")
+    seen["pet_dir"] = kw.get("pet_dir")
+    seen["slot"] = a[5] if len(a) > 5 else kw.get("slot")   # title,msg,buttons,timeout,corner,slot
+    return (124, "")
+try:
+    m.load_config = lambda: hook_cfg
+    m._attach_prompts = lambda c: True
+    m.toast_ask = _cap_toast
+    m.acquire_slot = lambda *a, **kw: (acq_calls.append(1), 0)[1]
+    m.release_slot = lambda *a, **kw: None
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        m.hook_pretooluse(wait_payload)
+    want("attached prompt passes attach=True/slot=None and skips the corner slot",
+         seen.get("attach") is True and seen.get("slot") is None
+         and seen.get("pet_dir") and not acq_calls)
+finally:
+    m._attach_prompts, m.toast_ask, m.acquire_slot, m.release_slot, m.load_config = (
+        _attach_o, _toast_o, _acq_o, _rel_o, _lc_o)
+
+# The plan and question paths honor attach the same way the prompt path does —
+# same attach=True/slot=None/pet_dir contract, so the pet hosts every kind of
+# interactive prompt, not just approvals.
+_attach_o2, _toast_o2 = m._attach_prompts, m.toast_ask
+plan_seen, q_seen = {}, {}
+def _cap_plan(*a, **kw):
+    plan_seen.update(attach=kw.get("attach"), pet_dir=kw.get("pet_dir"),
+                     slot=(a[5] if len(a) > 5 else kw.get("slot")))
+    return (0, "Approve")
+def _cap_q(*a, **kw):
+    q_seen.update(attach=kw.get("attach"), pet_dir=kw.get("pet_dir"),
+                  slot=(a[5] if len(a) > 5 else kw.get("slot")))
+    return (0, "")
+try:
+    m._attach_prompts = lambda c: True
+    m.toast_ask = _cap_plan
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.prompt_plan(pet_payload, hook_cfg, {"title": "Plan", "message": "ready", "project": "noti"})
+    want("attached plan passes attach=True/slot=None",
+         plan_seen.get("attach") is True and plan_seen.get("slot") is None and plan_seen.get("pet_dir"))
+    m.toast_ask = _cap_q
+    qd = {"project": "noti", "items": [{"title": "Q", "message": "m", "buttons": ["1", "2"],
+          "options": ["A", "B"], "descriptions": ["", ""], "question": "q?"}]}
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.prompt_question(pet_payload, hook_cfg, qd)
+    want("attached question passes attach=True/slot=None",
+         q_seen.get("attach") is True and q_seen.get("slot") is None and q_seen.get("pet_dir"))
+finally:
+    m._attach_prompts, m.toast_ask = _attach_o2, _toast_o2
+
+for raw, label in [("not json", "garbage hook stdin exits 0"),
+                   ("[]", "non-dict hook payload exits 0")]:
+    old_stdin = sys.stdin
+    sys.stdin = io.StringIO(raw)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = m.cmd_hook(type("Args", (), {"event": "pretooluse"})())
+        want(label, rc == 0 and out.getvalue() == "")
+    finally:
+        sys.stdin = old_stdin
+
+# hook_stop publishes 'done' BEFORE the summary.enabled early-return, so the
+# pet's end-of-turn clear of a standing 'waiting' works even with summaries off.
+import pathlib
+done_dir = tempfile.mkdtemp()
+done_cfg = copy.deepcopy(cfg)
+done_cfg["pet"]["enabled"] = True
+done_cfg["pet"]["state_dir"] = done_dir
+done_cfg["summary"]["enabled"] = False
+_lc = m.load_config
+try:
+    m.load_config = lambda: done_cfg
+    rc = m.hook_stop({"cwd": CWD, "session_id": "done-sess"})
+    done_state = json.load(open(os.path.join(done_dir, "done-sess.json")))
+    want("hook_stop writes done pet state even with summaries off",
+         rc == 0 and done_state["state"] == "done")
+finally:
+    m.load_config = _lc
+
+# A hostile session_id (semi-trusted hook payload) must never place a state file
+# outside pet.state_dir, and must always yield a non-empty sanitized name.
+hostile_cfg = copy.deepcopy(cfg)
+hostile_cfg["pet"]["state_dir"] = tempfile.mkdtemp()
+hostile_root = os.path.realpath(hostile_cfg["pet"]["state_dir"])
+hostile_ok = True
+for sid in ["../../evil", "/etc/passwd", "", "...", "._.", "a" * 500,
+            "../../../.claude/settings", "a/b/c"]:
+    rp = os.path.realpath(str(m.pet_session_path({"session_id": sid}, hostile_cfg)))
+    base = os.path.basename(rp)
+    hostile_ok = hostile_ok and os.path.dirname(rp) == hostile_root \
+        and base.endswith(".json") and len(base) > len(".json")
+want("hostile session_id can't escape pet.state_dir", hostile_ok)
+
+# Regression (pre-existing, adjacent): tally paths must sanitize session_id the
+# same way — a raw id like "../../pwned" used to escape TALLY_DIR and clobber an
+# arbitrary .json via atomic_write_json/os.replace.
+tally_tmp = tempfile.mkdtemp()
+_TALLY = m.TALLY_DIR
+try:
+    m.TALLY_DIR = pathlib.Path(tally_tmp)
+    m.tally_record({"tool_name": "Bash", "tool_input": {"command": "x"},
+                    "session_id": "../../pwned"})
+    escaped = os.path.exists(os.path.join(tally_tmp, "..", "..", "pwned.json"))
+    landed = [f for f in os.listdir(tally_tmp) if f.endswith(".json")]
+    want("tally_record sanitizes hostile session_id (no dir escape)",
+         not escaped and len(landed) == 1)
+finally:
+    m.TALLY_DIR = _TALLY
+
+# stop_pet's pid verification is safety-critical: the pid file survives pet
+# crashes/reboots, so a reused pid whose argv merely LOOKS like the pet (an
+# editor open on the sources) must not be SIGTERMed; only an exact command
+# match is our pet; an unverifiable pid (ps failed) is left strictly alone.
+killed = []
+_pidcmd, _oskill, _pidfile = m.pet_pid_command, os.kill, m.PET_PID_FILE
+life_tmp = tempfile.mkdtemp()
+life_cfg = copy.deepcopy(cfg)
+life_cfg["pet"]["state_dir"] = life_tmp
+try:
+    m.PET_PID_FILE = pathlib.Path(life_tmp) / "pet.pid"
+    os.kill = lambda pid, sig: killed.append(pid)
+    # (a) reused pid, substring look-alike -> no kill, pid file cleared
+    m.PET_PID_FILE.write_text("4242")
+    m.pet_pid_command = lambda pid: "/usr/bin/vim bin/noti-toast.swift pet-notes.md"
+    m.stop_pet(life_cfg, quiet=True)
+    want("stop_pet spares a reused pid that only looks like the pet",
+         killed == [] and not m.PET_PID_FILE.exists())
+    # (b) exact match -> our pet -> SIGTERM sent, pid file cleared
+    m.PET_PID_FILE.write_text("4242")
+    m.pet_pid_command = lambda pid: f"{m.BINARY} pet"
+    m.stop_pet(life_cfg, quiet=True)
+    want("stop_pet kills the verified pet",
+         killed == [4242] and not m.PET_PID_FILE.exists())
+    # (c) ps unverifiable -> leave the process AND pid file, return 1
+    killed.clear()
+    m.PET_PID_FILE.write_text("4242")
+    m.pet_pid_command = lambda pid: None
+    rc = m.stop_pet(life_cfg, quiet=True)
+    want("stop_pet leaves an unverifiable pid untouched",
+         killed == [] and rc == 1 and m.PET_PID_FILE.exists())
+finally:
+    m.pet_pid_command, os.kill, m.PET_PID_FILE = _pidcmd, _oskill, _pidfile
+
+# cmd_pet refuses a duplicate launch (one critter, one question) rather than
+# orphaning the first pet by clobbering its pid file.
+_isrun, _launch, _lc2 = m.pet_is_running, m.launch_pet, m.load_config
+launched = []
+try:
+    enabled_cfg = copy.deepcopy(cfg)
+    enabled_cfg["pet"]["enabled"] = True
+    m.load_config = lambda: enabled_cfg
+    m.launch_pet = lambda c: (launched.append(1), 4321)[1]
+    m.pet_is_running = lambda: 9999
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.cmd_pet(type("A", (), {"stop": False})())
+    want("cmd_pet refuses a second launch when one is running",
+         rc == 0 and not launched and "already running" in out.getvalue())
+    m.pet_is_running = lambda: None
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = m.cmd_pet(type("A", (), {"stop": False})())
+    want("cmd_pet launches when no pet is running",
+         rc == 0 and launched == [1] and "started" in out.getvalue())
+finally:
+    m.pet_is_running, m.launch_pet, m.load_config = _isrun, _launch, _lc2
+
+# launch_pet confirms the process survived: an instant-exit binary (e.g. one
+# predating pet mode) is a clean error, not a false "started (pid N)", and
+# leaves no dead pid behind for --stop to trip over.
+_pf, _bin = m.PET_PID_FILE, m.BINARY
+lp_tmp = tempfile.mkdtemp()
+try:
+    m.PET_PID_FILE = pathlib.Path(lp_tmp) / "pet.pid"
+    m.BINARY = pathlib.Path("/usr/bin/true")   # exists, ignores args, exits 0
+    lp_cfg = copy.deepcopy(cfg)
+    lp_cfg["pet"]["state_dir"] = lp_tmp
+    raised = False
+    try:
+        m.launch_pet(lp_cfg)
+    except RuntimeError:
+        raised = True
+    want("launch_pet errors on an instantly-dying binary, leaves no dead pid",
+         raised and not m.PET_PID_FILE.exists())
+finally:
+    m.PET_PID_FILE, m.BINARY = _pf, _bin
 
 sys.exit(1 if bad else 0)
 PY
