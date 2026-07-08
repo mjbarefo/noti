@@ -762,6 +762,52 @@ try:
 finally:
     m.load_config = _lc
 
+# StopFailure: the turn died. The handler must (1) stand the pet's failed
+# summons, (2) read-AND-CLEAR the dead turn's tally so it can't leak into the
+# next turn's summary, (3) map documented reasons to copy and render unknown
+# reasons verbatim (control-stripped), (4) honor the alerts.stop_failure
+# kill-switch at hook time — and always exit 0.
+sf_dir = tempfile.mkdtemp()
+sf_cfg = copy.deepcopy(cfg)
+sf_cfg["pet"]["enabled"] = True
+sf_cfg["pet"]["state_dir"] = sf_dir
+_lc, _ts = m.load_config, m.toast_summary
+toasts = []
+try:
+    m.load_config = lambda: sf_cfg
+    m.toast_summary = lambda *a, **kw: toasts.append((a, kw))
+    m.tally_record({"tool_name": "Bash", "tool_input": {"command": "x"},
+                    "session_id": "sf-sess"})
+    rc = m.hook_stopfailure({"cwd": CWD, "session_id": "sf-sess",
+                             "reason": "rate_limit"})
+    sf_state = json.load(open(os.path.join(sf_dir, "sf-sess.json")))
+    want("stopfailure stands the pet's failed summons",
+         rc == 0 and sf_state["state"] == "failed")
+    want("stopfailure toasts the mapped reason as kind=error",
+         len(toasts) == 1 and toasts[0][0][1] == "Turn ended: rate limited"
+         and toasts[0][1].get("kind") == "error")
+    want("stopfailure footer carries the dead turn's tally",
+         toasts[0][1].get("footer", "") == "after ran 1 command")
+    rc = m.hook_stopfailure({"cwd": CWD, "session_id": "sf-sess",
+                             "reason": "weird_new_reason\x1bjunk"})
+    want("unknown reason renders verbatim, control-stripped",
+         rc == 0 and toasts[-1][0][1] == "Turn ended: weird_new_reason junk")
+    want("first read CLEARED the tally (no leak into later toasts)",
+         toasts[-1][1].get("footer", "") == "")
+    rc = m.hook_stopfailure({"cwd": CWD, "session_id": "sf-sess"})
+    want("missing reason -> generic copy",
+         rc == 0 and toasts[-1][0][1] == "Turn ended unexpectedly")
+    toasts.clear()
+    sf_cfg["alerts"]["stop_failure"] = False
+    os.unlink(os.path.join(sf_dir, "sf-sess.json"))
+    rc = m.hook_stopfailure({"cwd": CWD, "session_id": "sf-sess",
+                             "reason": "server_error"})
+    sf_state = json.load(open(os.path.join(sf_dir, "sf-sess.json")))
+    want("kill-switch silences the toast but still stands the pet",
+         rc == 0 and not toasts and sf_state["state"] == "failed")
+finally:
+    m.load_config, m.toast_summary = _lc, _ts
+
 # A hostile session_id (semi-trusted hook payload) must never place a state file
 # outside pet.state_dir, and must always yield a non-empty sanitized name.
 hostile_cfg = copy.deepcopy(cfg)

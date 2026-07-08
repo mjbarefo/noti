@@ -156,8 +156,9 @@ choice=$(noti ask --title "Deploy?" --message "ship to prod" --buttons Yes,No)
 noti notify --title "Build" --body "all targets compiled" --footer "12s · 0 warnings"
 ```
 
-Optional styling flags: `--kind run|edit|fetch|mcp|note|question|plan` (tints the
-icon chip; run/edit/fetch/mcp render the message in monospace), `--project NAME`
+Optional styling flags: `--kind run|edit|fetch|mcp|note|question|plan|error`
+(tints the icon chip; run/edit/fetch/mcp render the message in monospace;
+`error` is the red something-broke chip StopFailure uses), `--project NAME`
 (eyebrow line on ask toasts), `--footer TEXT` (small monospaced line on notify
 toasts).
 
@@ -181,6 +182,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `approval.bash_always_mode` | `exact` | `exact` = "Always" rule matches only this command (safe); `prefix` = broader |
 | `approval.rule_scope` | `project_local` | where "Always" writes rules: `project_local` / `project` / `global` |
 | `summary.show_tally` | `true` | append `ran N commands · edited M files` |
+| `alerts.stop_failure` | `true` | red toast when a turn dies (rate limit, auth, server error) instead of silence |
 | `pet.enabled` | `false` | opt into hook state-file writes and `noti pet` |
 | `pet.state_dir` | `~/.config/noti/pet` | per-session pet state files |
 | `pet.done_decay_seconds` | `6` | how long done/failed poses linger before asleep |

@@ -13,6 +13,7 @@ REUSABLE PRIMITIVES (any script/agent can call these):
 CLAUDE CODE HOOK ADAPTER (wired up by `noti install`):
     noti hook pretooluse   # reads PreToolUse JSON on stdin -> permission decision
     noti hook stop         # reads Stop JSON on stdin -> end-of-turn summary toast
+    noti hook stopfailure  # reads StopFailure JSON on stdin -> red turn-died toast
     noti decide            # dry-run: print the policy decision, never show a toast
 
 SETUP:
@@ -128,6 +129,13 @@ DEFAULT_CONFIG = {
         "max_chars": 240,
         "show_tally": True,
     },
+    "alerts": {
+        # StopFailure: the turn died (rate limit, auth, server error) and the
+        # summary toast the user is waiting for will never come — a red toast
+        # says so. R7 kill-switch; also checked at hook time so flipping it
+        # doesn't require a reinstall.
+        "stop_failure": True,
+    },
     "pet": {
         # OFF by default because the pet is the charter carve-out: it includes
         # calm running/asleep presence so the standing summons has somewhere to
@@ -135,8 +143,9 @@ DEFAULT_CONFIG = {
         # writes.
         "enabled": False,
         "state_dir": str(PET_DIR),
-        # done/failed are acknowledgments, not standing summonses; they decay
-        # quickly to asleep.
+        # done is an acknowledgment, not a standing summons; it decays quickly
+        # to asleep. failed IS a summons (the turn died, a human is needed) and
+        # stands on waiting_ttl_seconds like waiting does.
         "done_decay_seconds": 6,
         # How long a `waiting` state stands before the pet stops summoning.
         # This IS the standing summons: after the toast times out the prompt
@@ -1415,6 +1424,44 @@ def hook_stop(payload: dict) -> int:
         debug(f"summary toast failed: {e}")
     return 0
 
+
+# Reason -> copy, from the documented StopFailure reasons. An unknown reason
+# renders verbatim (control-stripped) — never guessed at, never hidden.
+STOP_FAILURE_COPY = {
+    "rate_limit": "Turn ended: rate limited",
+    "overloaded": "Turn ended: servers overloaded",
+    "authentication_failed": "Turn ended: authentication failed",
+    "billing_error": "Turn ended: billing error",
+    "server_error": "Turn ended: server error",
+    "max_output_tokens": "Turn ended: output token limit reached",
+}
+
+
+def hook_stopfailure(payload: dict) -> int:
+    """The turn died (rate limit, auth, server error): the summary toast the
+    user is waiting for will never come, so say so — the one red toast. Fires
+    INSTEAD of Stop, so the tally must be read-and-cleared here too or the
+    dead turn's counts leak into the next turn's summary."""
+    cfg = load_config()
+    pet_record(payload, cfg, "failed")             # the pet's alarmed summons
+    pet_sweep(cfg)
+    if not (cfg.get("alerts") or {}).get("stop_failure", True):
+        return 0
+    reason = str(payload.get("reason") or payload.get("stop_reason") or "").strip()
+    body = STOP_FAILURE_COPY.get(reason) \
+        or (f"Turn ended: {_display_line(reason)}" if reason else "Turn ended unexpectedly")
+    tline = format_tally(tally_read_and_clear(payload.get("session_id", "default"))) \
+        if cfg["summary"]["show_tally"] else ""
+    if tline:
+        tline = f"after {tline}"                   # the DEAD turn's work, not a summary
+    title = os.path.basename((payload.get("cwd") or "").rstrip("/")) or "Claude Code"
+    try:
+        toast_summary(title, body, cfg["toast"]["summary_timeout_seconds"],
+                      cfg["toast"]["corner"], kind="error", footer=tline)
+    except Exception as e:
+        debug(f"stop-failure toast failed: {e}")
+    return 0
+
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
@@ -1485,6 +1532,8 @@ def cmd_hook(a) -> int:
             return hook_pretooluse(payload)
         if a.event == "stop":
             return hook_stop(payload)
+        if a.event == "stopfailure":
+            return hook_stopfailure(payload)
     except Exception as e:
         debug(f"hook crash: {e}")                 # a noti bug must not break the session
         return 0
@@ -1582,6 +1631,7 @@ def cmd_install(a) -> int:
     script = shlex.quote(str(Path(__file__).resolve()))
     pre_cmd = f"{py} {script} hook pretooluse"
     stop_cmd = f"{py} {script} hook stop"
+    fail_cmd = f"{py} {script} hook stopfailure"
     matcher = "|".join(cfg["approval"]["governed_tools"]) + ("|mcp__.*" if cfg["approval"]["govern_mcp"] else "")
     if cfg["approval"].get("surface_questions", True):
         matcher += "|AskUserQuestion"
@@ -1623,6 +1673,8 @@ def cmd_install(a) -> int:
 
         hooks.setdefault("PreToolUse", []).append(_hook_block(pre_cmd, matcher=matcher, timeout=pre_timeout))
         hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
+        if (cfg.get("alerts") or {}).get("stop_failure", True):
+            hooks.setdefault("StopFailure", []).append(_hook_block(fail_cmd))
         atomic_write_json(target, data)
     print(f"installed noti hooks into {target}")
     print(f"  PreToolUse matcher: {matcher}")
@@ -1644,7 +1696,7 @@ def cmd_uninstall(a) -> int:
         print(f"no hooks in {target}")
         return 0
     removed = 0
-    for event in ("PreToolUse", "Stop"):
+    for event in ("PreToolUse", "Stop", "StopFailure"):
         blocks = data["hooks"].get(event, [])
         kept = []
         for blk in blocks:
@@ -1789,7 +1841,7 @@ def build_parser() -> argparse.ArgumentParser:
     pet.set_defaults(fn=cmd_pet)
 
     h = sub.add_parser("hook", help="Claude Code hook adapter (reads JSON on stdin)")
-    h.add_argument("event", choices=["pretooluse", "stop"])
+    h.add_argument("event", choices=["pretooluse", "stop", "stopfailure"])
     h.set_defaults(fn=cmd_hook)
 
     d = sub.add_parser("decide", help="dry-run the policy on stdin JSON (no toast)")

@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **A dead turn now says so (StopFailure).** When a turn dies on a rate
+  limit, auth failure, or server error, the summary toast the user is waiting
+  for never comes — previously that moment was pure silence. `noti install`
+  now registers the `StopFailure` hook: a red `error` toast (new kind, also
+  available to `noti notify --kind error`) names the reason from a documented
+  copy map (unknown reasons render verbatim, control-stripped), carries the
+  dead turn's tally as its footer ("after ran 3 commands · edited 1 file") —
+  read-and-cleared so it can't leak into the next turn's summary — and stands
+  the pet's alarmed `failed` summons, which now persists like `waiting`
+  instead of decaying in 6 seconds. Kill-switch: `alerts.stop_failure`.
+  Existing installs: `noti uninstall && noti install` to register the event.
 - **Opt-in pet companion.** `noti pet` starts a small non-activating floating
   crab that watches best-effort per-session state files. It shares the toasts'
   frosted surface and *is* the delivery: on a summons it unfurls one card out of

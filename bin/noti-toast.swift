@@ -61,7 +61,8 @@
 //   NOTI_PET_WAITING_TTL seconds before a waiting state decays when no hook
 //                 clears it (default 1800 = pet.waiting_ttl_seconds's default;
 //                 launch_pet clamps to at least ask_timeout+30)
-//   NOTI_PET_DONE_TTL seconds before done/failed decay to asleep (default 6)
+//   NOTI_PET_DONE_TTL seconds before done decays to asleep (default 6);
+//                 failed is a summons and stands on the waiting TTL instead
 //   NOTI_PET_PID_FILE pid file to remove on direct pet UI close (best-effort)
 //   NOTI_PET_SNAPSHOT_DIR  write a PNG of the pet surface after each state
 //                 change (snapshot/design aid; pairs with preview-toasts)
@@ -235,6 +236,9 @@ func kindColor(_ kind: String) -> NSColor {
     case "note":     return claude
     case "question": return .systemIndigo
     case "plan":     return .systemGreen
+    // Red is warranted: this is the one toast whose message is "something
+    // broke", and borrowing note's terracotta would dilute the identity color.
+    case "error":    return .systemRed
     default:         return .systemGray
     }
 }
@@ -248,6 +252,7 @@ func kindGlyph(_ kind: String) -> String {
     case "note":     return "sparkles"
     case "question": return "questionmark.bubble.fill"
     case "plan":     return "checklist"
+    case "error":    return "exclamationmark.triangle.fill"
     default:         return "questionmark"
     }
 }
@@ -1806,8 +1811,12 @@ func petParseSession(_ url: URL, now: Date, waitingTTL: Double, doneTTL: Double)
         if let parsed = PetMood(rawValue: parts[0]) { mood = parsed }
         if parts.count > 1 { project = parts[1] }
     }
-    if mood == .waiting && age > waitingTTL { return nil }
-    if (mood == .done || mood == .failed) && age > doneTTL { return nil }
+    // waiting AND failed are summonses — a human is needed — so both stand on
+    // the waiting TTL. Only done is a mere acknowledgment that decays fast.
+    // (A failed turn self-heals like waiting: resuming that session's next
+    // hook overwrites the state.)
+    if (mood == .waiting || mood == .failed) && age > waitingTTL { return nil }
+    if mood == .done && age > doneTTL { return nil }
     return PetSession(id: url.deletingPathExtension().lastPathComponent,
                       mood: mood, project: project, modified: modified)
 }

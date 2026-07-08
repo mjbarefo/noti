@@ -41,7 +41,7 @@ Verdicts: `shipped` · `adopt-P1` · `adopt-P2` · `investigate` · `skip`.
 | PreToolUse | shipped | The core: approval/question/plan toasts. The only handler that may ever emit a decision (R1). |
 | Stop | shipped | End-of-turn summary + tally. Inert by design — never blocks (R2). |
 | Notification / `permission_prompt` | **adopt-P1** | The flagship gap: when noti falls back (toast timeout, Esc, ungoverned tool) the terminal dialog shows and today the user gets *zero signal* — the exact moment noti exists for. |
-| StopFailure (all reasons) | **adopt-P1** | Turn died on rate-limit/auth/server error; the user waits for a summary toast that never comes. Tiny surface, human-needed moment. |
+| StopFailure (all reasons) | **shipped 2026-07-08** | Turn died on rate-limit/auth/server error; the user waits for a summary toast that never comes. Red `error` toast with reason copy + the dead turn's tally as footer; also stands the pet's `failed` summons. Kill-switch `alerts.stop_failure`. Existing installs need `noti uninstall && noti install` to register the new event. |
 | PostToolUseFailure | **adopt-P2** | Silent tally-only, so the summary can say "· 1 failed" — the difference between "done" and "done, but look". Never a per-failure toast (spam). |
 | Elicitation / ElicitationResult | investigate | An MCP server blocking the session on user input is AskUserQuestion's class, but the contract needs a spike first. |
 | Notification / `elicitation_*` | investigate | Folded into the Elicitation spike — same question. |
@@ -210,7 +210,7 @@ these govern growth.
 | shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its crab, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
 | shipped 2026-07-08 | Summons duration + a real standing summons | The summons card shows how long it has stood (`noti · 4m`); `pet.waiting_ttl_seconds` (default 30 min, clamped ≥ ask_timeout+30) replaces the toast-lifetime bound that retracted the summons 30s after the toast died. |
 | P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the crab using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
-| P3 | Document `--kind error` | Falls out of StopFailure; README only. |
+| shipped 2026-07-08 | Document `--kind error` | Fell out of StopFailure; README's reusable-primitives styling flags. |
 
 ## The pet — a standing summons (design)
 
@@ -289,8 +289,8 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   kept waiting in the terminal; a summons bounded by the *toast's* lifetime
   contradicts "the pet is the standing form of the summons", so the bound is
   now "away from desk". `running` never expires (a stale "running" from a
-  killed session costs a calm pose, not a false summons); `done`/`failed`
-  decay to asleep. Known blind spot, documented on purpose: no hook fires
+  killed session costs a calm pose, not a false summons); `done` decays fast
+  to asleep; `failed` is a summons and stands on the waiting TTL. Known blind spot, documented on purpose: no hook fires
   when a terminal prompt is *answered*, so `waiting` clears only at the
   session's next PreToolUse/Stop — self-healing and usually seconds-fast
   (the approved tool's own PreToolUse, or Stop). The one true stale case is
