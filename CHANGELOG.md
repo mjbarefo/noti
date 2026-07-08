@@ -46,6 +46,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (measured: 0.1% CPU awake, 0.0% asleep). The robot fronting an attached
   prompt card breathes and blinks the same way, so the retract handoff reveals
   a pet mid-breath instead of a jump from a frozen glow.
+- **Click the summons, land in the right terminal.** Clicking the pet's
+  standing `Claude needs you` card now focuses the terminal that owns the
+  waiting session. Hooks stamp the session's TTY and terminal app into the
+  summons state file (a ppid walk from the hook process — the shell ancestors
+  carry the TTY that `cwd` alone could never disambiguate); the pet then
+  selects the Terminal.app tab whose `tty` matches via AppleScript, falls
+  back to activating the owning app (iTerm2, VS Code, ssh chains), and by
+  design does nothing when identity wasn't captured — it never focuses a
+  guessed window. Spike-verified before wiring (`docs/spikes/spike-focus.sh`);
+  first click may show a one-time macOS Automation consent. Kill-switch:
+  `pet.focus_terminal`.
 - **The summons actually stands — and says how long.** The pet's
   `Claude needs you` card now shows how long the summons has stood
   (`noti · 4m`; the oldest wait when several sessions stand), and a new

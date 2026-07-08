@@ -600,6 +600,46 @@ want("pet state file is sanitized JSON",
      pet_files == ["pet_safe.json"] and pet_data["state"] == "waiting"
      and pet_data["project"] == os.path.basename(CWD))
 
+# Click-to-focus identity rides ONLY the summons writes (waiting/failed) and
+# only with pet.focus_terminal on; a capture failure must still publish the
+# mood (fail-open), and running/done writes never pay the ps walk.
+foc_dir = tempfile.mkdtemp()
+foc_cfg = copy.deepcopy(cfg)
+foc_cfg["pet"]["enabled"] = True
+foc_cfg["pet"]["state_dir"] = foc_dir
+foc_payload = {"cwd": CWD, "session_id": "foc-sess"}
+_ti = m._terminal_identity
+ti_calls = []
+try:
+    m._terminal_identity = lambda: (ti_calls.append(1),
+                                    {"tty": "ttys010", "app": "Terminal"})[1]
+    m.pet_record(foc_payload, foc_cfg, "waiting")
+    foc_state = json.load(open(os.path.join(foc_dir, "foc-sess.json")))
+    want("waiting write carries focus identity",
+         foc_state["focus"] == {"tty": "ttys010", "app": "Terminal"})
+    ti_calls.clear()
+    m.pet_record(foc_payload, foc_cfg, "running")
+    foc_state = json.load(open(os.path.join(foc_dir, "foc-sess.json")))
+    want("running write skips the identity walk entirely",
+         not ti_calls and "focus" not in foc_state)
+    foc_cfg["pet"]["focus_terminal"] = False
+    m.pet_record(foc_payload, foc_cfg, "waiting")
+    foc_state = json.load(open(os.path.join(foc_dir, "foc-sess.json")))
+    want("focus_terminal=False captures nothing",
+         foc_state["state"] == "waiting" and "focus" not in foc_state)
+    foc_cfg["pet"]["focus_terminal"] = True
+    def _ti_boom():
+        raise RuntimeError("ps exploded")
+    m._terminal_identity = _ti_boom
+    m.pet_record(foc_payload, foc_cfg, "failed")
+    foc_state = json.load(open(os.path.join(foc_dir, "foc-sess.json")))
+    want("capture failure still publishes the mood (fail-open)",
+         foc_state["state"] == "failed" and "focus" not in foc_state)
+finally:
+    m._terminal_identity = _ti
+want("_terminal_identity returns a dict without crashing",
+     isinstance(m._terminal_identity(), dict))
+
 hook_dir = tempfile.mkdtemp()
 hook_cfg = copy.deepcopy(cfg)
 hook_cfg["pet"]["enabled"] = True
@@ -935,6 +975,13 @@ try:
     m.launch_pet(lp_cfg)
     want("launch_pet clamps waiting TTL to ask_timeout+30",
          captured.get("env", {}).get("NOTI_PET_WAITING_TTL") == "120")
+
+    want("launch_pet wires click-to-focus on by default",
+         captured.get("env", {}).get("NOTI_PET_FOCUS") == "1")
+    lp_cfg["pet"]["focus_terminal"] = False
+    m.launch_pet(lp_cfg)
+    want("focus_terminal=False wires NOTI_PET_FOCUS=0",
+         captured.get("env", {}).get("NOTI_PET_FOCUS") == "0")
 finally:
     m.PET_PID_FILE, m.BINARY = _pf, _bin
     m.subprocess.Popen, m.time.sleep = _popen, _sleep

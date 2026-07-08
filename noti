@@ -165,6 +165,15 @@ DEFAULT_CONFIG = {
         # (R3) — the pet only lends its position and its face. R7 kill-switch:
         # set false to keep the crab and route prompts to the corner as before.
         "attach_prompts": True,
+        # Click-to-focus: clicking the standing summons focuses the terminal
+        # tab that owns the oldest waiting session — by TTY for Terminal.app
+        # (spike-verified: docs/spikes/spike-focus.sh), by plain app
+        # activation otherwise, and by design NOTHING when identity wasn't
+        # captured (never focus a guessed window). First use may show a
+        # one-time macOS Automation consent for the toast binary. R7
+        # kill-switch: false makes the summons card inert again and skips
+        # identity capture entirely.
+        "focus_terminal": True,
     },
 }
 
@@ -382,6 +391,7 @@ def launch_pet(cfg: dict) -> int:
         int((cfg.get("pet") or {}).get("waiting_ttl_seconds", 1800)),
         int(cfg["toast"]["ask_timeout_seconds"]) + 30))
     env["NOTI_PET_DONE_TTL"] = str((cfg.get("pet") or {}).get("done_decay_seconds", 6))
+    env["NOTI_PET_FOCUS"] = "1" if (cfg.get("pet") or {}).get("focus_terminal", True) else "0"
     env["NOTI_PET_PID_FILE"] = str(PET_PID_FILE)
     env["NOTI_CORNER"] = cfg["toast"]["corner"]
     proc = subprocess.Popen(
@@ -461,6 +471,36 @@ def pet_session_path(payload: dict, cfg: dict) -> Path:
     return pet_state_dir(cfg) / f"{_safe_sid(sid)}.json"
 
 
+def _terminal_identity() -> dict:
+    """Best-effort identity of the terminal hosting this hook's session, for
+    the pet's click-to-focus (verdict: docs/spikes/spike-focus.sh). One ps
+    snapshot, then a ppid walk up from this hook process: the nearest ancestor
+    with a real TTY names the tab (the shell/login carry it; the terminal app
+    itself reports '??'), and the launchd child at the top of the chain names
+    the app (Terminal, iTerm2, Code, ...). Returns {} when nothing was found;
+    focus identity is garnish on the summons, never load-bearing."""
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,tty=,comm="],
+                         capture_output=True, text=True, timeout=2).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            procs[parts[0]] = (parts[1], parts[2], parts[3])
+    tty = app = ""
+    pid, hops = str(os.getpid()), 0
+    while pid in procs and hops < 40:
+        ppid, ptty, comm = procs[pid]
+        if not tty and ptty not in ("??", "-", ""):
+            tty = ptty                              # short form (ttysNNN), no /dev/
+        if ppid == "1" and pid != "1":
+            app = os.path.basename(comm)            # the terminal emulator process
+            break
+        if ppid == pid:
+            break
+        pid, hops = ppid, hops + 1
+    return {"tty": tty, "app": app} if (tty or app) else {}
+
+
 def pet_record(payload: dict, cfg: dict, state: str) -> None:
     """Best-effort pet state publish. Hook correctness never depends on this."""
     try:
@@ -473,13 +513,24 @@ def pet_record(payload: dict, cfg: dict, state: str) -> None:
         project = os.path.basename(cwd.rstrip("/")) or "Claude Code"
         path = pet_session_path(payload, cfg)
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, {
+        data = {
             "state": state,
             "session_id": str(payload.get("session_id") or "default"),
             "project": project,
             "cwd": cwd,
             "updated_at": time.time(),
-        })
+        }
+        # Focus identity rides only the summons states — the only ones whose
+        # card is clickable — so the hot running/done writes stay one ps
+        # cheaper. Its own try: a failed capture must still publish the mood.
+        if state in ("waiting", "failed") and pcfg.get("focus_terminal", True):
+            try:
+                focus = _terminal_identity()
+                if focus:
+                    data["focus"] = focus
+            except Exception as e:
+                debug(f"focus capture failed: {e}")
+        atomic_write_json(path, data)
     except Exception as e:
         debug(f"pet state write failed: {e}")
 

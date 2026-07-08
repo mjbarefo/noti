@@ -209,6 +209,7 @@ these govern growth.
 | shipped 2026-07-07 | The pet — a standing summons | Opt-in ambient companion: one non-capturing state-file reader, never a toast suppressor. |
 | shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its crab, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
 | shipped 2026-07-08 | Summons duration + a real standing summons | The summons card shows how long it has stood (`noti · 4m`); `pet.waiting_ttl_seconds` (default 30 min, clamped ≥ ask_timeout+30) replaces the toast-lifetime bound that retracted the summons 30s after the toast died. |
+| shipped 2026-07-08 | Click-to-focus on the standing summons | Spiked by Codex (`docs/spikes/spike-focus.sh`), then wired: hooks stamp TTY + terminal app via ppid walk on summons writes; a click focuses the Terminal.app tab by tty, activates the app as the floor, does nothing when uncaptured. `pet.focus_terminal` kill-switch. |
 | P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the crab using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
 | shipped 2026-07-08 | Document `--kind error` | Fell out of StopFailure; README's reusable-primitives styling flags. |
 
@@ -306,9 +307,16 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   Only a summons (`waiting`/`failed`) presents the card; every resting state
   stays inert — no counts, no project names — per the charter carve-out. Each state keeps a distinct static crab pose so
   reduce-motion loses only the motion — the unfurl and the idle life (beacon
-  breath, blink, gaze, sleep-z, mood reactions) — never the meaning. Focusing the right
-  terminal window on click is still a spike question (hook payloads carry only
-  `cwd`, ambiguous across tabs and unresolvable over ssh/tmux), not a promise.
+  breath, blink, gaze, sleep-z, mood reactions) — never the meaning. Clicking a standing
+  summons focuses the terminal that owns it (answered 2026-07-08 by
+  `docs/spikes/spike-focus.sh`, feasible-with-cost): the hook's ppid walk
+  stamps the session's TTY + terminal app into the waiting/failed state file
+  (`cwd` alone was ambiguous — the ancestry isn't), the pet focuses the
+  Terminal.app tab whose `tty` matches via AppleScript, falls back to plain
+  app activation (iTerm2/VS Code/ssh chains), and by design does NOTHING when
+  identity wasn't captured — never focus a guessed window. Cost: a one-time
+  Automation consent for the toast binary on first click. R7 kill-switch:
+  `pet.focus_terminal`.
 - **Personality without a pipeline**: frames are embedded sprite data
   (zero-dep holds); `pet.sprite` may point at a user-supplied sprite-sheet
   PNG — validated on load, silent fallback to the embedded default —
@@ -317,12 +325,16 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   (the `toast_summary` `start_new_session` pattern); killed by
   `noti uninstall`; no launchd, so no reboot persistence — you re-summon it,
   and that price is documented rather than papered over.
-- **Spike questions**: sprite frames vs CALayer vector poses; CPU/battery of
-  an always-on surface (animate only on state change?); one pet vs
-  per-session pets when several sessions wait at once (until resolved, the
-  click card may name more than one); whether any terminal-focus affordance
-  is feasible at all; whether the pet ever suppresses a toast (current
-  answer: never — different surface class, R5 satisfied by design).
+- **Spike questions**: sprite frames vs CALayer vector poses (answered in
+  practice: parametric vector poses + render-server layers, no sprite
+  pipeline); CPU/battery of an always-on surface (answered 2026-07-08: all
+  repeating motion is render-server CAAnimation, blinks are one-shot timers —
+  0.1% CPU awake, 0.0% asleep); one pet vs per-session pets when several
+  sessions wait at once (until resolved, the click card may name more than
+  one); terminal-focus feasibility (answered 2026-07-08, feasible-with-cost —
+  see the States bullet and `docs/spikes/spike-focus.sh`); whether the pet
+  ever suppresses a toast (current answer: never — different surface class,
+  R5 satisfied by design).
 
 **Rejected**, with reasons, so they don't get re-litigated:
 

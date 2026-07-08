@@ -64,6 +64,8 @@
 //   NOTI_PET_DONE_TTL seconds before done decays to asleep (default 6);
 //                 failed is a summons and stands on the waiting TTL instead
 //   NOTI_PET_PID_FILE pid file to remove on direct pet UI close (best-effort)
+//   NOTI_PET_FOCUS 1|0 — click-to-focus on the standing summons (wire for
+//                 pet.focus_terminal; default on)
 //   NOTI_PET_SNAPSHOT_DIR  write a PNG of the pet surface after each state
 //                 change (snapshot/design aid; pairs with preview-toasts)
 //   NOTI_PET_REDUCE_MOTION 1|0 — force the reduce-motion branch (snapshot
@@ -1122,6 +1124,10 @@ struct PetSession {
     let mood: PetMood
     let project: String
     let modified: Date       // when the hook stamped this state (file mtime)
+    // Click-to-focus identity, captured by the hook's ppid walk at summons
+    // time (spike: docs/spikes/spike-focus.sh). Empty = never guess.
+    let focusTTY: String     // short form (ttysNNN)
+    let focusApp: String     // terminal emulator process name (Terminal, ...)
 }
 
 final class PetPanel: NSPanel {
@@ -1574,6 +1580,9 @@ final class PetView: NSView {
     }
 
     var onClose: (() -> Void)?
+    // A plain click (no drag, not the ×) on the robot tile — the driver
+    // routes it to click-to-focus when a summons is standing.
+    var onTap: (() -> Void)?
     // Fired after a drag settles, so the driver re-anchors and re-lays-out.
     var onMoved: (() -> Void)?
     // Fired continuously during a drag so the driver can republish the live
@@ -1655,7 +1664,7 @@ final class PetView: NSView {
             }
             return
         }
-        if dragged { onMoved?() }
+        if dragged { onMoved?() } else { onTap?() }
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -1799,11 +1808,16 @@ func petParseSession(_ url: URL, now: Date, waitingTTL: Double, doneTTL: Double)
     let data = try? Data(contentsOf: url)
     var mood: PetMood = .running
     var project = url.deletingPathExtension().lastPathComponent
+    var focusTTY = "", focusApp = ""
 
     if let data,
        let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let s = obj["state"] as? String, let parsed = PetMood(rawValue: s) { mood = parsed }
         if let p = obj["project"] as? String, !p.isEmpty { project = p }
+        if let f = obj["focus"] as? [String: Any] {
+            focusTTY = (f["tty"] as? String) ?? ""
+            focusApp = (f["app"] as? String) ?? ""
+        }
     } else if let data,
               let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty {
@@ -1818,7 +1832,8 @@ func petParseSession(_ url: URL, now: Date, waitingTTL: Double, doneTTL: Double)
     if (mood == .waiting || mood == .failed) && age > waitingTTL { return nil }
     if mood == .done && age > doneTTL { return nil }
     return PetSession(id: url.deletingPathExtension().lastPathComponent,
-                      mood: mood, project: project, modified: modified)
+                      mood: mood, project: project, modified: modified,
+                      focusTTY: focusTTY, focusApp: focusApp)
 }
 
 func petReadSessions(waitingTTL: Double, doneTTL: Double) -> [PetSession] {
@@ -1879,9 +1894,23 @@ func petSummary(_ sessions: [PetSession]) -> (PetMood, String) {
     return (top.mood, caption)
 }
 
+// The pet's frosted surface, tap-aware: clicks on the CARD region (the robot
+// tile is PetView and handles its own) reach here via the responder chain —
+// the labels aren't editable, so an unfurled "Claude needs you" is clickable
+// across its whole width, not just on the robot.
+final class PetCardSurface: NSVisualEffectView {
+    var onTap: (() -> Void)?
+    private var downAt = NSPoint.zero
+    override func mouseDown(with event: NSEvent) { downAt = NSEvent.mouseLocation }
+    override func mouseUp(with event: NSEvent) {
+        let now = NSEvent.mouseLocation
+        if abs(now.x - downAt.x) + abs(now.y - downAt.y) <= 3 { onTap?() }
+    }
+}
+
 struct PetChrome {
     let panel: PetPanel
-    let surface: NSVisualEffectView
+    let surface: PetCardSurface
     let view: PetView
     let titleLabel: NSTextField
     let subtitleLabel: NSTextField
@@ -1965,11 +1994,97 @@ final class PetDriver {
     // A summons is the only thing that presents a card; everything else rests.
     private func isSummons(_ m: PetMood) -> Bool { m == .waiting || m == .failed }
 
+    // Click-to-focus (verdict: docs/spikes/spike-focus.sh, feasible-with-cost).
+    // A click on the standing summons focuses the terminal tab that owns the
+    // oldest waiting session: by TTY for Terminal.app, by plain app activation
+    // otherwise, and by design NOTHING when identity wasn't captured — never
+    // focus a guessed window. Gated on an actual summons (a calm robot stays
+    // inert) and the NOTI_PET_FOCUS kill-switch wire (pet.focus_terminal).
+    private var focusTarget: (tty: String, app: String)?
+    func petTapped() {
+        guard presenting, (env["NOTI_PET_FOCUS"] ?? "1") != "0",
+              let target = focusTarget else { return }
+        if target.app == "Terminal" && !target.tty.isEmpty {
+            focusTerminalTab(shortTTY: target.tty)
+        } else if !target.app.isEmpty {
+            // Degradation floor for iTerm2/VS Code/ssh chains: bring the
+            // owning app forward and stop — its own window state is unknown.
+            guard let app = NSWorkspace.shared.runningApplications
+                .first(where: { $0.localizedName == target.app }) else { return }
+            if #available(macOS 14, *) {
+                // Cooperative activation: the user's click on the summons IS
+                // the interaction that entitles this app to hand focus over.
+                app.activate()
+            } else {
+                app.activate(options: [.activateIgnoringOtherApps])
+            }
+        }
+    }
+
+    // The tab-focus AppleScript the spike verified: whose-clause match first,
+    // manual tab loop as the fallback, then select + raise + activate. The
+    // tty travels as an env var read by `system attribute` — never spliced
+    // into the script source. Fire-and-forget on osascript: the UI must not
+    // block on a first-use Automation consent dialog.
+    private func focusTerminalTab(shortTTY: String) {
+        let script = """
+        set targetShort to system attribute "NOTI_FOCUS_TARGET_TTY"
+        set targetFull to "/dev/" & targetShort
+        tell application "Terminal"
+            try
+                repeat with w in windows
+                    set matches to every tab of w whose tty is targetFull
+                    if (count of matches) > 0 then
+                        set selected tab of w to (item 1 of matches)
+                        set index of w to 1
+                        activate
+                        return
+                    end if
+                end repeat
+            end try
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set tabTTY to ""
+                    try
+                        set tabTTY to tty of t as text
+                    end try
+                    if tabTTY is targetFull then
+                        set selected tab of w to t
+                        set index of w to 1
+                        activate
+                        return
+                    end if
+                end repeat
+            end repeat
+        end tell
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-"]
+        var penv = ProcessInfo.processInfo.environment
+        penv["NOTI_FOCUS_TARGET_TTY"] = shortTTY
+        p.environment = penv
+        let stdin = Pipe()
+        p.standardInput = stdin
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return }             // best-effort, silent miss
+        stdin.fileHandleForWriting.write(Data(script.utf8))
+        stdin.fileHandleForWriting.closeFile()
+    }
+
     func refresh() {
         let sessions = petReadSessions(waitingTTL: waitingTTL, doneTTL: doneTTL)
             .sorted { $0.id < $1.id }
         let (mood, caption) = petSummary(sessions)
-        let signature = sessions.map { "\($0.id):\($0.mood.rawValue):\($0.project)" }
+        // The click focuses the session the caption is about: the oldest
+        // standing summons. Tracked before the signature guard would matter —
+        // focusTTY is IN the signature, so a re-prompt from a new tab (same
+        // mood, same project, new tty) still refreshes the target.
+        focusTarget = sessions.filter { $0.mood == mood && isSummons(mood) }
+            .min(by: { $0.modified < $1.modified })
+            .map { ($0.focusTTY, $0.focusApp) }
+        let signature = sessions.map { "\($0.id):\($0.mood.rawValue):\($0.project):\($0.focusTTY)" }
             .joined(separator: "|") + "=>\(mood.rawValue):\(caption)"
         guard signature != lastSignature else { return }
         let old = view.mood
@@ -2131,7 +2246,7 @@ func makePetPanel() -> PetChrome {
     // of the toast family, not a separate app icon. It IS the delivery surface:
     // it grows into a card on a summons. The robot draws transparently on top and
     // the surface's clip reveals the card as it unfurls.
-    let surface = NSVisualEffectView(frame: NSRect(origin: .zero, size: tile))
+    let surface = PetCardSurface(frame: NSRect(origin: .zero, size: tile))
     surface.autoresizingMask = [.width, .height]
     surface.material = .popover
     surface.state = .active
@@ -2646,6 +2761,10 @@ case "pet":
     }
     chrome.view.onMoved = { [weak driver] in driver?.petMoved() }
     chrome.view.onDragMove = { [weak driver] in driver?.petDragging() }
+    // Both tap surfaces route to one place: the robot tile (PetView) and the
+    // unfurled card region (PetCardSurface) are the same summons to a click.
+    chrome.view.onTap = { [weak driver] in driver?.petTapped() }
+    chrome.surface.onTap = { [weak driver] in driver?.petTapped() }
     NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                            object: app, queue: .main) { [weak driver] _ in
         driver?.reclamp()
