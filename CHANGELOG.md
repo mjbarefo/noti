@@ -35,6 +35,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (measured: 0.1% CPU awake, 0.0% asleep). The robot fronting an attached
   prompt card breathes and blinks the same way, so the retract handoff reveals
   a pet mid-breath instead of a jump from a frozen glow.
+- **The summons actually stands — and says how long.** The pet's
+  `Claude needs you` card now shows how long the summons has stood
+  (`noti · 4m`; the oldest wait when several sessions stand), and a new
+  `pet.waiting_ttl_seconds` (default 30 minutes, never less than
+  `ask_timeout+30`) replaces the old toast-lifetime bound that retracted the
+  standing summons 30 seconds after the toast timed out — while the prompt it
+  announced was still waiting in the terminal. A prompt answered in the
+  terminal still self-heals within seconds via that session's next hook; only
+  a session killed mid-prompt can leave a false summons, and it dies at the
+  TTL.
 - **Pet mood-matrix snapshots.** `NOTI_PET_SNAPSHOT_DIR` writes a PNG of the
   whole pet surface after each state change settles, and
   `NOTI_PET_REDUCE_MOTION` forces the static branch for deterministic

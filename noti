@@ -136,9 +136,19 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "state_dir": str(PET_DIR),
         # done/failed are acknowledgments, not standing summonses; they decay
-        # quickly to asleep. waiting uses ask_timeout+30 instead, so a terminal
-        # fallback has the same natural bound as the blocked hook.
+        # quickly to asleep.
         "done_decay_seconds": 6,
+        # How long a `waiting` state stands before the pet stops summoning.
+        # This IS the standing summons: after the toast times out the prompt
+        # keeps waiting in the terminal, and the pet standing there asking is
+        # the whole reason it exists — so the bound is "away from desk", not
+        # "toast lifetime". The stale cost is small and self-healing: a prompt
+        # answered in the terminal is overwritten by that session's next hook
+        # (seconds later, no hook fires on the answer itself), so only a
+        # session KILLED mid-prompt leaves a false summons, and it dies at
+        # this TTL. launch_pet clamps the effective value to at least
+        # ask_timeout+30 so a summons can never expire under a live toast.
+        "waiting_ttl_seconds": 1800,
         # When the pet is running, deliver the approval/question/plan toast AS
         # the pet: the interactive card unfurls out of the crab at its spot and
         # occludes it, instead of a separate corner toast plus a decorative pet
@@ -357,7 +367,11 @@ def launch_pet(cfg: dict) -> int:
         raise FileNotFoundError(f"{BINARY} missing — run `noti build`")
     env = dict(os.environ)
     env["NOTI_PET_STATE_DIR"] = str(pet_state_dir(cfg))
-    env["NOTI_PET_WAITING_TTL"] = str(int(cfg["toast"]["ask_timeout_seconds"]) + 30)
+    # Clamp: the standing summons must never expire while its toast can still
+    # be on screen, whatever waiting_ttl_seconds a user configures.
+    env["NOTI_PET_WAITING_TTL"] = str(max(
+        int((cfg.get("pet") or {}).get("waiting_ttl_seconds", 1800)),
+        int(cfg["toast"]["ask_timeout_seconds"]) + 30))
     env["NOTI_PET_DONE_TTL"] = str((cfg.get("pet") or {}).get("done_decay_seconds", 6))
     env["NOTI_PET_PID_FILE"] = str(PET_PID_FILE)
     env["NOTI_CORNER"] = cfg["toast"]["corner"]

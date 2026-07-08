@@ -50,7 +50,8 @@ echo '{"state":"done","project":"noti"}'    > "$S/a.json"; sleep 1   # 03 done
 echo '{"state":"failed","project":"noti"}'  > "$S/a.json"; sleep 1   # 04 failed + card
 echo '{"state":"waiting","project":"noti"}' > "$S/a.json"; sleep 1   # 05 waiting + card
 echo '{"state":"waiting","project":"web"}'  > "$S/b.json"; sleep 1   # 06 "2 sessions"
-kill $PET
+touch -A -0330 "$S/a.json"; sleep 1.5        # 07 "2 sessions · 3m" (oldest wait;
+kill $PET                                    #    picked up by the 0.5s poll, not kqueue)
 ```
 
 Read each PNG and critique: beacon color matches the mood (teal running,

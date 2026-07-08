@@ -208,6 +208,7 @@ these govern growth.
 | P2 | Opt-in per-toast sound | Accessibility: `toast.sound` (default false). NSSound is AppKit — zero-dep holds. Distinct (or no) sound for summary vs ask, so ask stays salient. |
 | shipped 2026-07-07 | The pet — a standing summons | Opt-in ambient companion: one non-capturing state-file reader, never a toast suppressor. |
 | shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its crab, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
+| shipped 2026-07-08 | Summons duration + a real standing summons | The summons card shows how long it has stood (`noti · 4m`); `pet.waiting_ttl_seconds` (default 30 min, clamped ≥ ask_timeout+30) replaces the toast-lifetime bound that retracted the summons 30s after the toast died. |
 | P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the crab using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
 | P3 | Document `--kind error` | Falls out of StopFailure; README only. |
 
@@ -281,17 +282,25 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   `done` / `failed`) into a state dir; the pet kqueue-watches it (the slot
   re-pack pattern) and shows the most-urgent state. **No mtime heartbeat** —
   unlike slot files, nothing lives to re-touch these between hooks, so a
-  10-minute build would go falsely stale. Instead: `waiting` expires on its
-  natural bound (`ask_timeout + 30`); `running` never expires (a stale
-  "running" from a killed session costs a calm pose, not a false summons);
-  `done`/`failed` decay to asleep. Known blind spot, documented on purpose:
-  no hook fires when a terminal prompt is *answered*, so `waiting` clears
-  only at the session's next PreToolUse/Stop — self-healing, but late. Hook
+  10-minute build would go falsely stale. Instead: `waiting` stands for
+  `pet.waiting_ttl_seconds` (default 30 min, clamped to ≥ `ask_timeout + 30`).
+  The original sketch bounded it at `ask_timeout + 30` — but that expired the
+  standing summons 30s after the toast died, while the prompt it announces
+  kept waiting in the terminal; a summons bounded by the *toast's* lifetime
+  contradicts "the pet is the standing form of the summons", so the bound is
+  now "away from desk". `running` never expires (a stale "running" from a
+  killed session costs a calm pose, not a false summons); `done`/`failed`
+  decay to asleep. Known blind spot, documented on purpose: no hook fires
+  when a terminal prompt is *answered*, so `waiting` clears only at the
+  session's next PreToolUse/Stop — self-healing and usually seconds-fast
+  (the approved tool's own PreToolUse, or Stop). The one true stale case is
+  a session killed with a prompt pending: its false summons dies at the TTL. Hook
   writes are best-effort: a failed write degrades to a wrong-mood pet, never
   a blocked session.
 - **States**: *waiting on you* (the live attached prompt is unfurled out of the
   crab and occluding the pet; once it times out, the pet's own `Claude needs you`
-  card stands in its place, project/count named — the whole point) · *running*
+  card stands in its place, project/count named plus how long it has stood
+  (`noti · 4m`, oldest wait when several stand) — the whole point) · *running*
   (calm resting crab, no words) · *done* (brief ✓, then rest) · *turn failed*
   (alarmed, presents a card, pairs with StopFailure) · *no sessions* (asleep).
   Only a summons (`waiting`/`failed`) presents the card; every resting state

@@ -184,6 +184,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `pet.enabled` | `false` | opt into hook state-file writes and `noti pet` |
 | `pet.state_dir` | `~/.config/noti/pet` | per-session pet state files |
 | `pet.done_decay_seconds` | `6` | how long done/failed poses linger before asleep |
+| `pet.waiting_ttl_seconds` | `1800` | how long the standing summons stands when nothing answers (clamped to ≥ `ask_timeout`+30; the card also shows how long it has waited) |
 | `pet.attach_prompts` | `true` | when the pet is running, grow the prompt out of the crab (else corner toast) |
 
 ## Safety notes

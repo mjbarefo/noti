@@ -876,6 +876,19 @@ try:
          pid == 7777 and captured.get("argv") == [str(m.BINARY), "pet"]
          and captured.get("env", {}).get("NOTI_PET_PID_FILE") == str(m.PET_PID_FILE)
          and m.PET_PID_FILE.read_text() == "7777")
+
+    # The standing summons stands for pet.waiting_ttl_seconds, but never less
+    # than ask_timeout+30 — a summons expiring under a still-live toast would
+    # retract the card out from under the prompt it announces.
+    lp_cfg["pet"]["waiting_ttl_seconds"] = 3600
+    m.launch_pet(lp_cfg)
+    want("launch_pet exports configured waiting TTL",
+         captured.get("env", {}).get("NOTI_PET_WAITING_TTL") == "3600")
+    lp_cfg["pet"]["waiting_ttl_seconds"] = 5      # below the toast's lifetime
+    lp_cfg["toast"]["ask_timeout_seconds"] = 90
+    m.launch_pet(lp_cfg)
+    want("launch_pet clamps waiting TTL to ask_timeout+30",
+         captured.get("env", {}).get("NOTI_PET_WAITING_TTL") == "120")
 finally:
     m.PET_PID_FILE, m.BINARY = _pf, _bin
     m.subprocess.Popen, m.time.sleep = _popen, _sleep

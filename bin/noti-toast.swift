@@ -59,7 +59,8 @@
 //                 aid; live toasts follow the system)
 //   NOTI_PET_STATE_DIR  directory of pet state JSON files, one per session
 //   NOTI_PET_WAITING_TTL seconds before a waiting state decays when no hook
-//                 clears it (default 120)
+//                 clears it (default 1800 = pet.waiting_ttl_seconds's default;
+//                 launch_pet clamps to at least ask_timeout+30)
 //   NOTI_PET_DONE_TTL seconds before done/failed decay to asleep (default 6)
 //   NOTI_PET_PID_FILE pid file to remove on direct pet UI close (best-effort)
 //   NOTI_PET_SNAPSHOT_DIR  write a PNG of the pet surface after each state
@@ -1115,6 +1116,7 @@ struct PetSession {
     let id: String
     let mood: PetMood
     let project: String
+    let modified: Date       // when the hook stamped this state (file mtime)
 }
 
 final class PetPanel: NSPanel {
@@ -1807,7 +1809,7 @@ func petParseSession(_ url: URL, now: Date, waitingTTL: Double, doneTTL: Double)
     if mood == .waiting && age > waitingTTL { return nil }
     if (mood == .done || mood == .failed) && age > doneTTL { return nil }
     return PetSession(id: url.deletingPathExtension().lastPathComponent,
-                      mood: mood, project: project)
+                      mood: mood, project: project, modified: modified)
 }
 
 func petReadSessions(waitingTTL: Double, doneTTL: Double) -> [PetSession] {
@@ -1831,6 +1833,17 @@ func petReadSessions(waitingTTL: Double, doneTTL: Double) -> [PetSession] {
     }
 }
 
+// How long a summons has stood, glanceable: nothing under a minute (a fresh
+// summons needs no stopwatch), then "4m", then "1h 12m". Bounded in practice
+// by the waiting TTL.
+func petElapsedLabel(_ since: Date, now: Date = Date()) -> String? {
+    let minutes = Int(now.timeIntervalSince(since) / 60)
+    guard minutes >= 1 else { return nil }
+    if minutes < 60 { return "\(minutes)m" }
+    return minutes % 60 == 0 ? "\(minutes / 60)h"
+                             : "\(minutes / 60)h \(minutes % 60)m"
+}
+
 func petSummary(_ sessions: [PetSession]) -> (PetMood, String) {
     guard let top = sessions.max(by: { $0.mood.urgency < $1.mood.urgency }) else {
         return (.asleep, "asleep")
@@ -1844,10 +1857,17 @@ func petSummary(_ sessions: [PetSession]) -> (PetMood, String) {
         return (top.mood, top.mood.rawValue)
     }
     let matching = sessions.filter { $0.mood == top.mood }
-    if matching.count == 1 {
-        return (top.mood, matching[0].project)
+    let caption = matching.count == 1 ? matching[0].project
+                                      : "\(matching.count) sessions"
+    // The summons may say how long it has stood — that is summons information,
+    // inside the carve-out. Oldest wait when several stand: the card answers
+    // "how ignored am I", and the honest answer is the worst one. The caption
+    // feeds the refresh signature, so the minute rollover redraws on the
+    // existing 0.5s poll — no new timer.
+    if let waited = matching.map(\.modified).min().flatMap({ petElapsedLabel($0) }) {
+        return (top.mood, caption + " · " + waited)
     }
-    return (top.mood, "\(matching.count) sessions")
+    return (top.mood, caption)
 }
 
 struct PetChrome {
@@ -2590,7 +2610,7 @@ case "pet":
     let chrome = makePetPanel()
     activePanel = chrome.panel
     let driver = PetDriver(chrome: chrome,
-                           waitingTTL: petTimeout("NOTI_PET_WAITING_TTL", default: 120),
+                           waitingTTL: petTimeout("NOTI_PET_WAITING_TTL", default: 1800),
                            doneTTL: petTimeout("NOTI_PET_DONE_TTL", default: 6))
     chrome.view.onClose = {
         // A UI close is the same intent as `noti pet --stop`, and this is the only
