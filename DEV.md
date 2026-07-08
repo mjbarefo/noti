@@ -296,7 +296,8 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   (alarmed, presents a card, pairs with StopFailure) · *no sessions* (asleep).
   Only a summons (`waiting`/`failed`) presents the card; every resting state
   stays inert — no counts, no project names — per the charter carve-out. Each state keeps a distinct static crab pose so
-  reduce-motion loses only the unfurl, never the meaning. Focusing the right
+  reduce-motion loses only the motion — the unfurl and the idle life (beacon
+  breath, blink, gaze, sleep-z, mood reactions) — never the meaning. Focusing the right
   terminal window on click is still a spike question (hook payloads carry only
   `cwd`, ambiguous across tabs and unresolvable over ssh/tmux), not a promise.
 - **Personality without a pipeline**: frames are embedded sprite data

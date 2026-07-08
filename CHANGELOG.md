@@ -24,6 +24,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it. New `pet.attach_prompts` (default `true`) is the kill-switch back to
   corner toasts. Off (pet disabled), nothing changes.
 
+- **The pet is alive.** The robot blinks every few seconds (randomly — a
+  metronome blink reads as a cursor), glances toward whatever card it is
+  presenting, lands a `done` with a happy squash-and-rebound bounce, startles
+  with a shake on `failed`, and floats a slow fading "z" while asleep. All of
+  it is reduce-motion-gated, and none of it costs the CPU anything: blinks are
+  one-shot timers (two redraws each), and every repeating motion — including
+  the beacon's breathing halo, previously a 30fps timer redraw burning ~5% CPU
+  all session — now runs on the render server while the process sleeps
+  (measured: 0.1% CPU awake, 0.0% asleep). The robot fronting an attached
+  prompt card breathes and blinks the same way, so the retract handoff reveals
+  a pet mid-breath instead of a jump from a frozen glow.
+- **Pet mood-matrix snapshots.** `NOTI_PET_SNAPSHOT_DIR` writes a PNG of the
+  whole pet surface after each state change settles, and
+  `NOTI_PET_REDUCE_MOTION` forces the static branch for deterministic
+  captures — one pet process can walk every mood and emit a labeled pose
+  matrix for design review (procedure in the preview-toasts skill).
+
 ### Changed
 - **Toast motion, refined end to end.** Cards now arrive the way system
   banners do — a fade plus a short slide in from the corner's screen edge —
@@ -40,6 +57,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   surface. Reduce-motion keeps the fades and drops the slides.
 
 ### Fixed
+- **Summons text stays on the card for a left-half pet.** The unfurled
+  `Claude needs you` labels used a flexible-left-margin autoresizing mask on
+  one side, so a pet resting on the left half of the screen unfurled a card
+  whose text slid off-panel by the width delta. Both labels now hold their
+  left position invariant through the resize. Same class of bug fixed in the
+  reduce-motion jump-cut path, where the robot tile itself landed off-panel
+  (pre-positioned subviews double-shifted by autoresizing).
 - **"Always" no longer mints junk rules.** Approving a heredoc/multiline or
   >200-character command with Always used to write the entire script into
   `permissions.allow` as an exact "rule" — one that could never match a future

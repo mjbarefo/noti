@@ -62,6 +62,10 @@
 //                 clears it (default 120)
 //   NOTI_PET_DONE_TTL seconds before done/failed decay to asleep (default 6)
 //   NOTI_PET_PID_FILE pid file to remove on direct pet UI close (best-effort)
+//   NOTI_PET_SNAPSHOT_DIR  write a PNG of the pet surface after each state
+//                 change (snapshot/design aid; pairs with preview-toasts)
+//   NOTI_PET_REDUCE_MOTION 1|0 — force the reduce-motion branch (snapshot
+//                 determinism; live pets follow the system setting)
 //
 // Design notes (these are deliberate):
 //   * .accessory activation policy  -> no Dock icon, no menu bar.
@@ -1153,11 +1157,24 @@ private func petPalette(_ mood: PetMood) -> (chassis: NSColor, accent: NSColor, 
     }
 }
 
+// The upright antenna ball's center for a robot drawn in `square` — one
+// definition shared by the draw path and the breathing halo layer, so the
+// render-server halo sits exactly on the drawn ball (head.maxY + the 6pt rise).
+func petBeaconCenter(in square: NSRect) -> NSPoint {
+    NSPoint(x: square.midX, y: square.minY + 64)
+}
+
 // Paint the robot into `square` (its own 72pt tile in the caller's coordinates).
 // AppKit is y-up, so the antenna sits at high y and the legs at low y. The robot
 // carries only its own state (eyes / a chest glyph / the beacon); every word
 // lives in whatever card sits beside it, so a resting robot stays inert.
-func drawRobot(in square: NSRect, mood: PetMood, cardSide: CardSide, beaconGlow: CGFloat = 1) {
+// beaconGlow scales the DRAWN halo discs (the ball always paints at full
+// saturation); a caller whose halo lives on a CALayer passes 0 so the discs
+// aren't painted twice. blinking briefly closes the lids of an awake robot;
+// drawSleepZ: false lets a caller whose "z" floats on a CALayer keep the
+// static one out of the same tile.
+func drawRobot(in square: NSRect, mood: PetMood, cardSide: CardSide, beaconGlow: CGFloat = 1,
+               blinking: Bool = false, drawSleepZ: Bool = true) {
     let (chassis, accent, beacon) = petPalette(mood)
     let ink = petInk
     let cx = square.midX
@@ -1189,15 +1206,23 @@ func drawRobot(in square: NSRect, mood: PetMood, cardSide: CardSide, beaconGlow:
 
     // The antenna beacon: a glowing dot that droops and dims only when asleep.
     // beaconGlow lets the caller breathe the halo in the attention states.
-    petAntenna(headTop: NSPoint(x: cx, y: head.maxY), beacon: beacon,
-               stalk: edge, drooped: mood == .asleep, glow: beaconGlow)
+    petAntenna(headTop: NSPoint(x: cx, y: head.maxY), upright: petBeaconCenter(in: square),
+               beacon: beacon, stalk: edge, drooped: mood == .asleep, glow: beaconGlow)
 
     if mood == .asleep {
-        petClosedEyes(head: head, ink: ink)
-        petText("z", in: NSRect(x: head.maxX - 4, y: head.maxY - 5, width: 12, height: 12),
-                size: 10, color: edge, bold: true)
+        petClosedEyes(head: head, ink: ink, gaze: .none)
+        if drawSleepZ {
+            petText("z", in: NSRect(x: head.maxX - 4, y: head.maxY - 5, width: 12, height: 12),
+                    size: 10, color: edge, bold: true)
+        }
     } else {
-        petEyes(head: head, ink: ink)
+        // The gaze rides the card side: a robot presenting a card looks at
+        // what it's saying — half of what sells robot-plus-card as one object.
+        if blinking {
+            petClosedEyes(head: head, ink: ink, gaze: cardSide)
+        } else {
+            petEyes(head: head, ink: ink, gaze: cardSide)
+        }
         petMouth(head: head, ink: ink)
     }
 
@@ -1260,10 +1285,10 @@ private func petArm(shoulder: NSPoint, dir: CGFloat, raised: Bool, color: NSColo
 // The antenna: a short stalk topped by the beacon ball. When lit, two faint
 // concentric rings fake a phosphor glow; asleep, the stalk leans and the ball
 // dims with no glow.
-private func petAntenna(headTop: NSPoint, beacon: NSColor, stalk: NSColor, drooped: Bool, glow: CGFloat) {
+private func petAntenna(headTop: NSPoint, upright: NSPoint, beacon: NSColor, stalk: NSColor, drooped: Bool, glow: CGFloat) {
     let ball = drooped
         ? NSPoint(x: headTop.x + 9, y: headTop.y + 4)
-        : NSPoint(x: headTop.x, y: headTop.y + 6)
+        : upright
     let stem = NSBezierPath()
     stem.move(to: headTop)
     stem.line(to: drooped ? NSPoint(x: headTop.x + 8, y: headTop.y + 4)
@@ -1287,19 +1312,32 @@ private func petAntenna(headTop: NSPoint, beacon: NSColor, stalk: NSColor, droop
     NSBezierPath(ovalIn: NSRect(x: ball.x - r, y: ball.y - r, width: r * 2, height: r * 2)).fill()
 }
 
-// Two open LED eyes in the upper face.
-private func petEyes(head: NSRect, ink: NSColor) {
+// How far the eyes slide toward a presented card. Small on purpose: a glance,
+// not a stare — the head never turns.
+private func petGazeShift(_ gaze: CardSide) -> CGFloat {
+    switch gaze {
+    case .left:  return -1.5
+    case .right: return 1.5
+    case .none:  return 0
+    }
+}
+
+// Two open LED eyes in the upper face, glancing toward `gaze`.
+private func petEyes(head: NSRect, ink: NSColor, gaze: CardSide) {
     ink.setFill()
-    for x in [head.midX - 9, head.midX + 4] {
+    let dx = petGazeShift(gaze)
+    for x in [head.midX - 9 + dx, head.midX + 4 + dx] {
         NSBezierPath(roundedRect: NSRect(x: x, y: head.midY - 1, width: 5, height: 7),
                      xRadius: 2, yRadius: 2).fill()
     }
 }
 
-// Lidded eyes — two short dashes — for the asleep pose.
-private func petClosedEyes(head: NSRect, ink: NSColor) {
+// Lidded eyes — two short dashes — for the asleep pose and mid-blink. They
+// keep the gaze shift so a blink doesn't snap the eyes back to center.
+private func petClosedEyes(head: NSRect, ink: NSColor, gaze: CardSide) {
     ink.setFill()
-    for x in [head.midX - 9, head.midX + 4] {
+    let dx = petGazeShift(gaze)
+    for x in [head.midX - 9 + dx, head.midX + 4 + dx] {
         NSBezierPath(roundedRect: NSRect(x: x, y: head.midY + 2, width: 5, height: 2),
                      xRadius: 1, yRadius: 1).fill()
     }
@@ -1312,49 +1350,222 @@ private func petMouth(head: NSRect, ink: NSColor) {
                  xRadius: 1, yRadius: 1).fill()
 }
 
+// The beacon breathes only in states that want your eye: a slow "thinking"
+// pulse while running, a faster, deeper one while it's actually summoning you.
+// Everything else — asleep, done — holds a steady light. nil = steady.
+func beaconBreathSpec(_ mood: PetMood) -> (period: CGFloat, floor: CGFloat)? {
+    switch mood {
+    case .running:          return (2.2, 0.62)
+    case .waiting, .failed: return (1.1, 0.48)
+    default:                return nil
+    }
+}
+
+// Reduce-motion, with the spike's env override kept so the snapshot harness
+// can force the static branch deterministically (NOTI_PET_REDUCE_MOTION=1/0).
+func petReduceMotion() -> Bool {
+    if let forced = env["NOTI_PET_REDUCE_MOTION"] { return forced != "0" }
+    return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+}
+
+// The breathing halo as a render-server animation: the two glow discs ride a
+// repeating opacity+scale ease between full glow and the spec's floor. This
+// replaces a 30fps timer redraw — the pet spike's checklist promised "no
+// continuous animation", and a long-lived surface must keep it: the process
+// sleeps while the beacon breathes. The solid ball stays in the draw path at
+// full saturation; only the halo discs live here.
+func makeBeaconHalo(center: NSPoint, mood: PetMood, period: CGFloat, floor: CGFloat) -> CALayer {
+    let beacon = petPalette(mood).beacon
+    let box = CALayer()
+    box.frame = NSRect(x: center.x - 6, y: center.y - 6, width: 12, height: 12)
+    for (r, a) in [(6.0, 0.16), (4.4, 0.30)] as [(CGFloat, CGFloat)] {
+        let disc = CAShapeLayer()
+        disc.path = CGPath(ellipseIn: CGRect(x: 6 - r, y: 6 - r, width: r * 2, height: r * 2),
+                           transform: nil)
+        disc.fillColor = beacon.withAlphaComponent(a).cgColor
+        box.addSublayer(disc)
+    }
+    let fade = CABasicAnimation(keyPath: "opacity")
+    fade.fromValue = 1.0
+    fade.toValue = floor
+    let swell = CABasicAnimation(keyPath: "transform.scale")
+    swell.fromValue = 1.0
+    swell.toValue = 0.82 + 0.18 * floor        // the drawn halo's radius ride
+    let breath = CAAnimationGroup()
+    breath.animations = [fade, swell]
+    breath.duration = period / 2
+    breath.autoreverses = true
+    breath.repeatCount = .infinity
+    breath.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+    box.add(breath, forKey: "beacon-breath")
+    return box
+}
+
+// (Re)build a view's breathing halo for `mood`. Returns nil when the light
+// should hold steady (non-breathing mood, or reduce-motion) — the caller's
+// draw path paints the static discs instead (beaconGlow 1 vs 0). cgColors
+// freeze at creation, so callers rebuild on effective-appearance changes.
+func rebuildHalo(_ old: CALayer?, on view: NSView, mood: PetMood) -> CALayer? {
+    old?.removeFromSuperlayer()
+    guard let spec = beaconBreathSpec(mood), !petReduceMotion() else { return nil }
+    view.wantsLayer = true
+    var built: CALayer?
+    view.effectiveAppearance.performAsCurrentDrawingAppearance {
+        let square = NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize)
+        let halo = makeBeaconHalo(center: petBeaconCenter(in: square), mood: mood,
+                                  period: spec.period, floor: spec.floor)
+        view.layer?.addSublayer(halo)
+        built = halo
+    }
+    return built
+}
+
+// A blink is two redraws every few seconds, scheduled with one-shot timers —
+// between blinks the process is fully idle, so the "no continuous animation"
+// CPU bound the beacon fix restored keeps holding. The random interval is
+// what reads as alive; a metronome blink reads as a cursor.
+final class BlinkDriver {
+    private var timer: Timer?
+    private let setLids: (Bool) -> Void
+    init(setLids: @escaping (Bool) -> Void) { self.setLids = setLids }
+    var active = false {
+        didSet {
+            guard active != oldValue else { return }
+            if active {
+                schedule()
+            } else {
+                timer?.invalidate()
+                timer = nil
+                setLids(false)           // never park a stopped robot mid-blink
+            }
+        }
+    }
+    private func schedule() {
+        let t = Timer(timeInterval: .random(in: 3.0...7.0), repeats: false) { [weak self] _ in
+            guard let self, self.active else { return }
+            self.setLids(true)
+            let open = Timer(timeInterval: 0.12, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.setLids(false)
+                if self.active { self.schedule() }
+            }
+            open.tolerance = 0.02
+            RunLoop.main.add(open, forMode: .common)
+            self.timer = open
+        }
+        t.tolerance = 0.5                // let the system coalesce our wakeups
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    deinit { timer?.invalidate() }
+}
+
+// The sleeping "z": a slow float-and-fade above the head — the one ambient
+// sign of life in the asleep pose. A repeating render-server animation, same
+// zero-CPU class as the beacon breath; the cycle starts and ends transparent
+// so the loop has no pop.
+func makeSleepZ(for view: NSView) -> CALayer {
+    let chassis = petPalette(.asleep).chassis
+    let z = CATextLayer()
+    z.string = "z"
+    z.font = NSFont.boldSystemFont(ofSize: 10)
+    z.fontSize = 10
+    z.alignmentMode = .center
+    z.foregroundColor = (chassis.shadow(withLevel: 0.28) ?? chassis).cgColor
+    z.contentsScale = view.window?.backingScaleFactor ?? 2
+    // The drawn z's tile (head.maxX - 4, head.maxY - 5) in the 72pt square.
+    z.frame = NSRect(x: 49, y: 53, width: 12, height: 12)
+    let rise = CABasicAnimation(keyPath: "transform.translation.y")
+    rise.fromValue = 0
+    rise.toValue = 7
+    let fade = CAKeyframeAnimation(keyPath: "opacity")
+    fade.values = [0, 1, 1, 0]
+    fade.keyTimes = [0, 0.18, 0.55, 1]
+    let drift = CAAnimationGroup()
+    drift.animations = [rise, fade]
+    drift.duration = 3.2
+    drift.repeatCount = .infinity
+    z.opacity = 0                        // the animation owns visibility
+    z.add(drift, forKey: "sleep-z")
+    return z
+}
+
 final class PetView: NSView {
-    var mood: PetMood = .asleep { didSet { needsDisplay = true; if mood != oldValue { updateBeacon() } } }
+    var mood: PetMood = .asleep { didSet { needsDisplay = true; if mood != oldValue { updateLife() } } }
     var cardSide: CardSide = .none { didSet { needsDisplay = true } }
 
-    // The beacon breathes only in states that want your eye: a slow "thinking"
-    // pulse while running, a faster, deeper one while it's actually summoning you.
-    // Everything else — asleep, done — holds a steady light. The pulse is a light-
-    // only halo breath (the ball never moves), and reduce-motion drops it entirely.
-    private var beaconTimer: Timer?
-    private var beaconPhase: CGFloat = 0
-    private var beaconSpec: (period: CGFloat, floor: CGFloat)? {
-        switch mood {
-        case .running:          return (2.2, 0.62)
-        case .waiting, .failed: return (1.1, 0.48)
-        default:                return nil
+    // The pet's idle life. Everything here is either a render-server layer
+    // (halo, sleep-z) or a one-shot timer (blink) — never a repeating redraw.
+    private var halo: CALayer?
+    private var sleepZ: CALayer?
+    private var lidsDown = false { didSet { needsDisplay = true } }
+    private lazy var blink = BlinkDriver { [weak self] down in self?.lidsDown = down }
+    private func updateLife() {
+        halo = rebuildHalo(halo, on: self, mood: mood)
+        blink.active = mood != .asleep && !petReduceMotion()
+        sleepZ?.removeFromSuperlayer()
+        sleepZ = nil
+        if mood == .asleep && !petReduceMotion() {
+            let z = makeSleepZ(for: self)
+            layer?.addSublayer(z)
+            sleepZ = z
+        }
+        needsDisplay = true
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLife()               // re-resolve the layers' frozen appearance colors
+    }
+
+    // The state-change reaction, in body language: done lands with a happy
+    // bounce, failed startles, everything else keeps the settle pulse — and
+    // falling asleep just... falls asleep. All transform animations on the
+    // backing layer (anchor = bottom-left, so y-scales squash toward the
+    // ground and the feet stay planted); nothing here re-enters draw().
+    func react(to newMood: PetMood) {
+        switch newMood {
+        case .done:   bounce()
+        case .failed: shake()
+        case .asleep: break
+        default:      pulse()
         }
     }
-    private var beaconGlow: CGFloat {
-        guard let spec = beaconSpec, beaconTimer != nil else { return 1 }
-        return spec.floor + (1 - spec.floor) * (0.5 + 0.5 * sin(beaconPhase))
-    }
-    private func updateBeacon() {
-        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        if beaconSpec != nil && !reduce {
-            guard beaconTimer == nil else { return }   // already breathing
-            let fps: CGFloat = 30
-            let t = Timer(timeInterval: 1.0 / TimeInterval(fps), repeats: true) { [weak self] _ in
-                guard let self, let spec = self.beaconSpec else { return }
-                self.beaconPhase += (2 * .pi) / (spec.period * fps)
-                if self.beaconPhase > 2 * .pi { self.beaconPhase -= 2 * .pi }
-                self.needsDisplay = true
-            }
-            // .common so the beacon keeps breathing through a drag's tracking loop.
-            RunLoop.main.add(t, forMode: .common)
-            beaconTimer = t
-        } else {
-            beaconTimer?.invalidate()
-            beaconTimer = nil
-            beaconPhase = 0
-            needsDisplay = true                        // settle back to a steady light
+
+    private func pulse() {
+        // Build the scale about the robot's own centre so the pulse settles
+        // in place, not from the layer's bottom-left anchor.
+        let cx = bounds.width / 2, cy = bounds.height / 2
+        func scaleAboutCenter(_ s: CGFloat) -> CATransform3D {
+            var t = CATransform3DMakeTranslation(cx, cy, 0)
+            t = CATransform3DScale(t, s, s, 1)
+            return CATransform3DTranslate(t, -cx, -cy, 0)
         }
+        let a = CABasicAnimation(keyPath: "transform")
+        a.fromValue = scaleAboutCenter(0.92)
+        a.toValue = scaleAboutCenter(1.0)
+        a.duration = 0.18
+        a.timingFunction = settleCurve
+        layer?.add(a, forKey: "pet-react")
     }
-    deinit { beaconTimer?.invalidate() }
+
+    private func bounce() {
+        // Squash-and-rebound instead of a jump: the tile has only ~2pt of
+        // headroom above the halo, so leaving the ground would clip the glow.
+        let a = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        a.values = [1.0, 0.90, 1.02, 1.0]
+        a.keyTimes = [0, 0.3, 0.7, 1]
+        a.duration = 0.45
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer?.add(a, forKey: "pet-react")
+    }
+
+    private func shake() {
+        let a = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        a.values = [0, -4, 4, -3, 3, -1, 0]
+        a.duration = 0.4
+        layer?.add(a, forKey: "pet-react")
+    }
+
     var onClose: (() -> Void)?
     // Fired after a drag settles, so the driver re-anchors and re-lays-out.
     var onMoved: (() -> Void)?
@@ -1364,6 +1575,10 @@ final class PetView: NSView {
     var onDragMove: (() -> Void)?
     private var hovering = false { didSet { needsDisplay = true } }
     private var closeArmed = false { didSet { needsDisplay = true } }
+    // A snapshot must capture the pose, not the cursor's accident: the driver
+    // raises this around cacheDisplay so a pointer parked on the pet can't
+    // bake the hover × into a design-review PNG.
+    var suppressHoverChrome = false { didSet { needsDisplay = true } }
     private var trackingArea: NSTrackingArea?
     private var dragStartMouse = NSPoint.zero
     private var dragStartOrigin = NSPoint.zero
@@ -1474,8 +1689,9 @@ final class PetView: NSView {
         NSColor.clear.setFill()
         dirtyRect.fill()
         drawRobot(in: NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize),
-                 mood: mood, cardSide: cardSide, beaconGlow: beaconGlow)
-        if hovering {
+                 mood: mood, cardSide: cardSide, beaconGlow: halo == nil ? 1 : 0,
+                 blinking: lidsDown, drawSleepZ: sleepZ == nil)
+        if hovering && !suppressHoverChrome {
             drawCloseButton()
         }
     }
@@ -1486,12 +1702,27 @@ final class PetView: NSView {
 // the movable pet. Click-through (hitTest -> nil) so it can never swallow a
 // stray click meant for the card that surrounds it.
 final class RobotIconView: NSView {
-    var mood: PetMood = .waiting { didSet { needsDisplay = true } }
+    var mood: PetMood = .waiting { didSet { needsDisplay = true; updateLife() } }
     var cardSide: CardSide = .none { didSet { needsDisplay = true } }
+    // Same render-server breath and blink as the pet beneath, so the retract
+    // handoff reveals a pet mid-breath instead of jumping from a frozen glow —
+    // and the robot fronting a prompt is exactly as alive as the one resting.
+    private var halo: CALayer?
+    private var lidsDown = false { didSet { needsDisplay = true } }
+    private lazy var blink = BlinkDriver { [weak self] down in self?.lidsDown = down }
+    private func updateLife() {
+        halo = rebuildHalo(halo, on: self, mood: mood)
+        blink.active = mood != .asleep && !petReduceMotion()
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLife()
+    }
     override func draw(_ dirtyRect: NSRect) {
         drawRobot(in: NSRect(x: 0, y: 0, width: petTileSize, height: petTileSize),
-                 mood: mood, cardSide: cardSide)
+                 mood: mood, cardSide: cardSide, beaconGlow: halo == nil ? 1 : 0,
+                 blinking: lidsDown)
     }
 }
 
@@ -1722,28 +1953,43 @@ final class PetDriver {
             subtitleLabel.stringValue = caption
         }
         if wantPresenting != presenting {
-            applyLayout(presenting: wantPresenting, animated: true)
+            // The unfurl is motion, not meaning (the DEV.md reduce-motion
+            // contract): under reduce-motion the card appears as a jump cut.
+            applyLayout(presenting: wantPresenting, animated: !petReduceMotion())
         }
-        if old != mood && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            pulse()
+        if old != mood && !petReduceMotion() {
+            view.react(to: mood)
         }
+        scheduleSnapshot(mood: mood, caption: caption)
     }
 
-    private func pulse() {
-        // NSView backing layers anchor at (0,0); build the scale about the
-        // robot's own centre so the pulse settles in place, not from a corner.
-        let cx = view.bounds.width / 2, cy = view.bounds.height / 2
-        func scaleAboutCenter(_ s: CGFloat) -> CATransform3D {
-            var t = CATransform3DMakeTranslation(cx, cy, 0)
-            t = CATransform3DScale(t, s, s, 1)
-            return CATransform3DTranslate(t, -cx, -cy, 0)
+    // Spike-parity snapshot hook: NOTI_PET_SNAPSHOT_DIR captures the whole
+    // surface (robot AND any presented card) after each state change settles —
+    // 0.35s covers the 0.2s unfurl — so a driver script can walk the moods and
+    // review every pose headlessly. Same cacheDisplay path as NOTI_SNAPSHOT,
+    // so no screen-recording permission; dev-only, unset in real installs.
+    private let snapshotDir = env["NOTI_PET_SNAPSHOT_DIR"].map {
+        URL(fileURLWithPath: $0, isDirectory: true)
+    }
+    private var snapshotCounter = 0
+    private var snapshotTimer: Timer?
+    private func scheduleSnapshot(mood: PetMood, caption: String) {
+        guard let dir = snapshotDir else { return }
+        snapshotTimer?.invalidate()
+        snapshotTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false) { [weak self] _ in
+            guard let self, let surface = self.panel.contentView,
+                  let rep = surface.bitmapImageRepForCachingDisplay(in: surface.bounds) else { return }
+            self.view.suppressHoverChrome = true
+            surface.cacheDisplay(in: surface.bounds, to: rep)
+            self.view.suppressHoverChrome = false
+            guard let png = rep.representation(using: .png, properties: [:]) else { return }
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            self.snapshotCounter += 1
+            let safe = caption.replacingOccurrences(of: "/", with: "_")
+                              .replacingOccurrences(of: " ", with: "_")
+            let name = String(format: "%02d-%@-%@.png", self.snapshotCounter, mood.rawValue, safe)
+            try? png.write(to: dir.appendingPathComponent(name))
         }
-        let a = CABasicAnimation(keyPath: "transform")
-        a.fromValue = scaleAboutCenter(0.92)
-        a.toValue = scaleAboutCenter(1.0)
-        a.duration = 0.18
-        a.timingFunction = settleCurve
-        view.layer?.add(a, forKey: "pet-state-pulse")
     }
 
     // The card unfurls into whichever side has room, so the robot never has to
@@ -1778,16 +2024,16 @@ final class PetDriver {
         let blockY = (tile - (titleH + gap + subH)) / 2
         subtitleLabel.frame = NSRect(x: cardX + pad, y: blockY, width: textW, height: subH)
         titleLabel.frame = NSRect(x: cardX + pad, y: blockY + subH + gap, width: textW, height: titleH)
-        let labelMask: NSView.AutoresizingMask = onLeft ? [.minXMargin] : [.maxXMargin]
-        titleLabel.autoresizingMask = labelMask
-        subtitleLabel.autoresizingMask = labelMask
+        // Labels are placed at their FINAL card coordinates before any resize,
+        // so their mask must hold minX invariant through it — a flexible right
+        // margin, on both sides. (A flexible LEFT margin shifts them by the
+        // width delta: at a left-half pet the summons text landed off-panel.)
+        titleLabel.autoresizingMask = [.maxXMargin]
+        subtitleLabel.autoresizingMask = [.maxXMargin]
 
         if presenting {                                 // revealed as the card grows
             titleLabel.isHidden = false
             subtitleLabel.isHidden = false
-        }
-        if !animated {                                  // no resize animation to run autoresizing
-            view.frame = NSRect(x: onLeft ? 0 : panelW - tile, y: 0, width: tile, height: tile)
         }
 
         if animated {
@@ -1804,7 +2050,13 @@ final class PetDriver {
                 }
             })
         } else {
+            // Order matters: setFrame first (autoresizing shifts subviews by the
+            // width delta), THEN pin the robot at its exact final tile — the
+            // reverse order leaves the pre-positioned robot shifted off-panel
+            // after autoresizing re-applies the delta (a jump-cut unfurl under
+            // reduce-motion is a real resize, unlike start()/petMoved()).
             panel.setFrame(frame, display: true)
+            view.frame = NSRect(x: onLeft ? 0 : panelW - tile, y: 0, width: tile, height: tile)
             if !presenting {
                 titleLabel.isHidden = true
                 subtitleLabel.isHidden = true
