@@ -4,6 +4,23 @@ All notable changes to `noti` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **"Claude needs you in the terminal" (Notification/permission_prompt).**
+  The flagship gap, closed: when a permission prompt reaches Claude's own
+  terminal dialog — the noti toast timed out while you were away, or the tool
+  isn't governed — you used to get zero signal at the exact moment noti
+  exists for. `noti install` now registers a `Notification` hook (matcher
+  `permission_prompt`) that shows a notify-only toast and stands the pet's
+  waiting summons (extending click-to-focus to ungoverned tools). Deliberate
+  hand-offs don't echo: Esc on a card, plan **View**, and the complex-set
+  notice drop a short-lived marker that suppresses the notification once —
+  Esc is told apart from timeout by elapsed time, and a missing or unreadable
+  marker always shows the toast rather than staying silent. Kill-switch:
+  `alerts.terminal_prompt`. Existing installs: `noti uninstall &&
+  noti install` to register the event.
+
 ## [0.6.1] — 2026-07-16
 
 The patch v0.6.0 taught us to need: a standing summons must stand *down* the
@@ -317,6 +334,7 @@ that diagnoses a stranger's most likely install problems.
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
+[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.6.1...HEAD
 [0.6.1]: https://github.com/mjbarefo/noti/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mjbarefo/noti/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mjbarefo/noti/compare/v0.4.0...v0.5.0

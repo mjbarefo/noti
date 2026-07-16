@@ -135,6 +135,12 @@ DEFAULT_CONFIG = {
         # says so. R7 kill-switch; also checked at hook time so flipping it
         # doesn't require a reinstall.
         "stop_failure": True,
+        # Notification/permission_prompt: a permission prompt is waiting in
+        # the terminal and noti isn't handling it (toast timed out, Esc, or an
+        # ungoverned tool) — the flagship gap. A notify-only toast says so,
+        # deduped against deliberate hand-offs via the .deferred marker.
+        # R7 kill-switch; checked at hook time too.
+        "terminal_prompt": True,
     },
     "pet": {
         # OFF by default because the pet is the charter carve-out: it includes
@@ -1126,15 +1132,53 @@ def tally_read_and_clear(sid: str):
             path.unlink(missing_ok=True)
         except Exception:
             pass
-        # sessions killed before their Stop hook leave tallies behind — sweep them
+        # sessions killed before their Stop hook leave tallies behind — sweep
+        # them, plus deferral markers that never met their notification (a
+        # marker is only meaningful for ~10s; anything this old is litter)
         try:
             cutoff = time.time() - 48 * 3600
-            for p in TALLY_DIR.glob("*.json"):
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
+            for pattern in ("*.json", "*.deferred"):
+                for p in TALLY_DIR.glob(pattern):
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
         except Exception:
             pass
     return data
+
+
+def defer_mark(sid, reason: str) -> None:
+    """Best-effort marker: this session's prompt was just handed to the
+    terminal DELIBERATELY (Esc on a card, plan View, a complex-set notice), so
+    the Notification/permission_prompt event arriving moments later would echo
+    a moment the user already saw (R5). Timeouts write NO marker on purpose —
+    an away user is exactly who needs the reminder. Lives beside the tally,
+    same hostile-sid filename discipline."""
+    try:
+        TALLY_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(TALLY_DIR / f"{_safe_sid(sid)}.deferred",
+                          {"reason": reason, "ts": time.time()})
+    except Exception as e:
+        debug(f"defer marker write failed: {e}")
+
+
+def defer_consume(sid, max_age: float = 10.0):
+    """Read-and-clear the deferral marker; the reason only when it is fresh.
+    Missing, stale, or unreadable all return None, and the caller must treat
+    None as SHOW — fail-open here means fail-toast, never fail-silent."""
+    path = TALLY_DIR / f"{_safe_sid(sid)}.deferred"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        path.unlink(missing_ok=True)
+        if time.time() - float(data.get("ts", 0)) <= max_age:
+            return str(data.get("reason") or "") or None
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        debug(f"defer marker read failed: {e}")
+        with contextlib.suppress(Exception):
+            path.unlink(missing_ok=True)
+    return None
 
 
 def format_tally(t) -> str:
@@ -1282,12 +1326,21 @@ def prompt_question(payload: dict, cfg: dict, d: dict) -> int:
                 # back to the terminal picker instead.
                 typed = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", typed).strip()
                 if not typed:
+                    # deliberate act at the card — the user is at the keyboard
+                    # watching this hand-off; a permission_prompt echo is noise
+                    defer_mark(payload.get("session_id", "default"), "esc")
                     return 0
                 # never trunc()/_display_line() here: display helpers must not
                 # touch an answer
                 answers[item["question"]] = typed
             else:
-                return 0    # esc / timeout / junk rc / sentinel-without-opt-in
+                # esc / timeout / junk rc / sentinel-without-opt-in. Esc is
+                # rc 124 with set budget left (same elapsed logic as the
+                # approval card); exhausted-budget and junk stay unmarked so
+                # the permission_prompt notification shows.
+                if rc == 124 and deadline - time.monotonic() > 2:
+                    defer_mark(payload.get("session_id", "default"), "esc")
+                return 0
             if i < n - 1 and slot is not None:
                 # the card's own atexit deleted the slot file; re-claim the
                 # slot before the next card spawns, or a concurrent session
@@ -1320,6 +1373,7 @@ def prompt_plan(payload: dict, cfg: dict, d: dict) -> int:
     actually show the whole plan and take feedback, handles it."""
     attach = _attach_prompts(cfg)
     slot = None if attach else acquire_slot()
+    started = time.monotonic()
     try:
         rc, _ = toast_ask(d["title"], d["message"], ["Approve", "View"],
                           cfg["toast"]["ask_timeout_seconds"], cfg["toast"]["corner"], slot,
@@ -1336,6 +1390,12 @@ def prompt_plan(payload: dict, cfg: dict, d: dict) -> int:
         tally_record(payload)
         pet_record(payload, cfg, "running")
         emit_pretool("allow", "noti: plan approved from toast")
+    elif rc == 1 or (rc == 124 and time.monotonic() - started
+                     < float(cfg["toast"]["ask_timeout_seconds"]) - 2):
+        # View is an explicit "take me to the terminal"; a short-ride 124 is
+        # Esc — either way the user chose this hand-off seconds ago, so the
+        # permission_prompt notification (if plan fallbacks fire it) dedups.
+        defer_mark(payload.get("session_id", "default"), "esc")
     return 0
 
 
@@ -1361,7 +1421,10 @@ def hook_pretooluse(payload: dict) -> int:
         return prompt_plan(payload, cfg, d)
     if action == "notice":
         # non-blocking heads-up (complex question set): no decision, just make
-        # sure the human knows the terminal is waiting on them
+        # sure the human knows the terminal is waiting on them. The notice IS
+        # this moment's toast — mark it so a permission_prompt notification
+        # (if question fallbacks fire one) can't double up (R5).
+        defer_mark(payload.get("session_id", "default"), "notice")
         try:
             toast_summary(d["title"], d["message"], cfg["toast"]["summary_timeout_seconds"],
                           cfg["toast"]["corner"], kind=d.get("kind", "question"),
@@ -1383,6 +1446,7 @@ def hook_pretooluse(payload: dict) -> int:
     # stack there), so acquire one only when not attaching.
     attach = _attach_prompts(cfg)
     slot = None if attach else acquire_slot()
+    started = time.monotonic()
     try:
         rc, label = toast_ask(d["title"], d["message"],
                               ["Yes", "Always", "No"] if mintable else ["Yes", "No"],
@@ -1417,7 +1481,15 @@ def hook_pretooluse(payload: dict) -> int:
         pet_record(payload, cfg, "running")
         emit_pretool("deny", "noti: denied by user")
     else:
-        # rc 124 (timeout) or dismissed -> hand back to Claude's terminal prompt
+        # rc 124 (timeout) or dismissed -> hand back to Claude's terminal
+        # prompt. The binary exits 124 for BOTH Esc and timeout, so tell them
+        # apart by elapsed time: materially shorter than the budget means a
+        # deliberate Esc — mark it so the permission_prompt notification
+        # doesn't echo a hand-off the user just chose (R5). A full ride means
+        # they were away: no marker, that reminder is the feature. Junk rcs
+        # also fall through unmarked — fail-toast, never fail-silent.
+        if rc == 124 and time.monotonic() - started < float(cfg["toast"]["ask_timeout_seconds"]) - 2:
+            defer_mark(payload.get("session_id", "default"), "esc")
         emit_pretool("ask", "noti: no response, asking in terminal")
     return 0
 
@@ -1511,6 +1583,37 @@ def hook_stopfailure(payload: dict) -> int:
                       cfg["toast"]["corner"], kind="error", footer=tline)
     except Exception as e:
         debug(f"stop-failure toast failed: {e}")
+    return 0
+
+
+def hook_notification(payload: dict) -> int:
+    """Notification/permission_prompt: Claude's own terminal permission dialog
+    is up and noti isn't handling it — the toast timed out, the user Esc'd to
+    the terminal, or the tool isn't governed. The flagship gap: this used to
+    be zero signal at the exact moment noti exists for. Notify-only (R1), kind
+    `note` — terracotta is the reserved "Claude wants me" signal and this IS
+    that moment. Dedup (R5): a fresh .deferred marker means the user chose
+    this hand-off seconds ago (Esc / plan View / complex-set notice) and needs
+    no echo; missing, stale, or unreadable markers all SHOW — fail-open here
+    means fail-toast, never fail-silent."""
+    cfg = load_config()
+    # The prompt is a standing summons whether or not we toast: this write
+    # covers ungoverned tools (hook_pretooluse never saw them) and refreshes
+    # the focus identity for click-to-focus on governed ones.
+    pet_record(payload, cfg, "waiting")
+    if not (cfg.get("alerts") or {}).get("terminal_prompt", True):
+        return 0
+    if defer_consume(payload.get("session_id", "default")):
+        debug("permission_prompt suppressed: fresh deferral marker")
+        return 0
+    title = os.path.basename((payload.get("cwd") or "").rstrip("/")) or "Claude Code"
+    try:
+        toast_summary(title,
+                      "Claude needs you in the terminal — a permission prompt is waiting",
+                      cfg["toast"]["summary_timeout_seconds"], cfg["toast"]["corner"],
+                      kind="note")
+    except Exception as e:
+        debug(f"terminal-prompt toast failed: {e}")
     return 0
 
 
@@ -1608,6 +1711,8 @@ def cmd_hook(a) -> int:
             return hook_stop(payload)
         if a.event == "stopfailure":
             return hook_stopfailure(payload)
+        if a.event == "notification":
+            return hook_notification(payload)
         if a.event == "userpromptsubmit":
             return hook_userpromptsubmit(payload)
         if a.event == "sessionend":
@@ -1712,6 +1817,7 @@ def cmd_install(a) -> int:
     fail_cmd = f"{py} {script} hook stopfailure"
     prompt_cmd = f"{py} {script} hook userpromptsubmit"
     end_cmd = f"{py} {script} hook sessionend"
+    notif_cmd = f"{py} {script} hook notification"
     matcher = "|".join(cfg["approval"]["governed_tools"]) + ("|mcp__.*" if cfg["approval"]["govern_mcp"] else "")
     if cfg["approval"].get("surface_questions", True):
         matcher += "|AskUserQuestion"
@@ -1755,6 +1861,11 @@ def cmd_install(a) -> int:
         hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
         if (cfg.get("alerts") or {}).get("stop_failure", True):
             hooks.setdefault("StopFailure", []).append(_hook_block(fail_cmd))
+        if (cfg.get("alerts") or {}).get("terminal_prompt", True):
+            # notify-only handlers get no timeout; the matcher scopes noti to
+            # the one notification class it has a verdict for (R6)
+            hooks.setdefault("Notification", []).append(
+                _hook_block(notif_cmd, matcher="permission_prompt"))
         # Pet self-heal housekeeping. Registered unconditionally (not gated on
         # pet.enabled) so toggling the pet on later doesn't need a reinstall:
         # with the pet off, both handlers no-op in a few ms and print nothing.
@@ -1781,7 +1892,8 @@ def cmd_uninstall(a) -> int:
         print(f"no hooks in {target}")
         return 0
     removed = 0
-    for event in ("PreToolUse", "Stop", "StopFailure", "UserPromptSubmit", "SessionEnd"):
+    for event in ("PreToolUse", "Stop", "StopFailure", "UserPromptSubmit",
+                  "SessionEnd", "Notification"):
         blocks = data["hooks"].get(event, [])
         kept = []
         for blk in blocks:
@@ -1881,12 +1993,16 @@ def cmd_doctor(a) -> int:
         line("hook matcher current", not stale,
              "matcher predates question/plan surfacing — `noti uninstall && noti install`" if stale else "")
         # An install predating the pet self-heal hooks leaves a summons
-        # standing after the user answers in the terminal — flag the drift.
-        missing = [ev for ev in ("UserPromptSubmit", "SessionEnd")
+        # standing after the user answers in the terminal, and one predating
+        # the Notification hook misses the terminal-prompt alert — flag both.
+        expected = ["UserPromptSubmit", "SessionEnd"]
+        if (cfg.get("alerts") or {}).get("terminal_prompt", True):
+            expected.append("Notification")
+        missing = [ev for ev in expected
                    if not any("noti" in h.get("command", "")
                               for blk in gd.get("hooks", {}).get(ev, [])
                               for h in blk.get("hooks", []))]
-        line("pet self-heal hooks present", not missing,
+        line("event set current", not missing,
              f"missing {'/'.join(missing)} — `noti uninstall && noti install`" if missing else "")
     print(f"  governed: {', '.join(cfg['approval']['governed_tools'])}"
           f"{' + mcp__*' if cfg['approval']['govern_mcp'] else ''}")
@@ -1935,7 +2051,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     h = sub.add_parser("hook", help="Claude Code hook adapter (reads JSON on stdin)")
     h.add_argument("event", choices=["pretooluse", "stop", "stopfailure",
-                                     "userpromptsubmit", "sessionend"])
+                                     "notification", "userpromptsubmit", "sessionend"])
     h.set_defaults(fn=cmd_hook)
 
     d = sub.add_parser("decide", help="dry-run the policy on stdin JSON (no toast)")

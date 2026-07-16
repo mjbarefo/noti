@@ -348,7 +348,7 @@ finally:
 
 # answer round-trip at the new 4-option arity: exit code 3 -> EXACT 4th option
 # via updatedInput; esc/timeout (124) and junk exit codes emit NO decision
-import io, contextlib
+import io, contextlib, pathlib
 q4 = {"questions": [{"question": "Pick one?",
                      "options": [{"label": "Alpha"}, {"label": "Beta"},
                                  {"label": "Gamma"}, {"label": "Delta (Recommended)"}],
@@ -646,7 +646,9 @@ hook_cfg["pet"]["enabled"] = True
 hook_cfg["pet"]["state_dir"] = hook_dir
 _load_config, _toast_ask, _acquire_slot, _release_slot = (
     m.load_config, m.toast_ask, m.acquire_slot, m.release_slot)
+_TALLY_SAVE = m.TALLY_DIR
 try:
+    m.TALLY_DIR = pathlib.Path(tempfile.mkdtemp())
     m.load_config = lambda: hook_cfg
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -668,9 +670,139 @@ try:
     want("prompt fallback leaves pet waiting",
          rc == 0 and wait_state["state"] == "waiting"
          and json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "ask")
+
+    # Esc vs timeout is decided by ELAPSED TIME (the binary exits 124 for
+    # both). The instant 124 above rode far under ask_timeout -> a deliberate
+    # Esc -> the deferral marker must exist so permission_prompt dedups.
+    marker = m.TALLY_DIR / "pet-wait.deferred"
+    want("instant 124 (esc) writes the deferral marker",
+         marker.exists() and json.load(open(marker))["reason"] == "esc")
+    marker.unlink()
+
+    # A full-ride 124 (real timeout: the user was away) must NOT mark — that
+    # notification is the reminder the feature exists for.
+    to_cfg = copy.deepcopy(hook_cfg)
+    to_cfg["toast"]["ask_timeout_seconds"] = 2   # instant return == full ride
+    m.load_config = lambda: to_cfg
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.hook_pretooluse(dict(wait_payload, session_id="pet-timeout"))
+    want("full-ride 124 (timeout) writes no marker",
+         not (m.TALLY_DIR / "pet-timeout.deferred").exists())
+
+    # Junk rc: no marker (fail-toast, never fail-silent).
+    m.load_config = lambda: hook_cfg
+    m.toast_ask = lambda *a, **kw: (99, "")
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.hook_pretooluse(dict(wait_payload, session_id="pet-junk"))
+    want("junk rc writes no marker",
+         not (m.TALLY_DIR / "pet-junk.deferred").exists())
+
+    # The complex-set notice IS this moment's toast: it must mark "notice" so
+    # a permission_prompt firing for the terminal picker can't double up (R5).
+    _tsum = m.toast_summary
+    m.toast_summary = lambda *a, **kw: None
+    try:
+        notice_payload = {"tool_name": "AskUserQuestion", "permission_mode": "default",
+                          "cwd": CWD, "session_id": "pet-notice",
+                          "tool_input": {"questions": [
+                              {"question": f"q{i}?", "options": ["a", "b"]} for i in range(5)]}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.hook_pretooluse(notice_payload)
+        nmark = m.TALLY_DIR / "pet-notice.deferred"
+        want("notice fallback writes the notice marker",
+             nmark.exists() and json.load(open(nmark))["reason"] == "notice")
+    finally:
+        m.toast_summary = _tsum
+
+    # Plan "View" is an explicit take-me-to-the-terminal: it must mark.
+    m.toast_ask = lambda *a, **kw: (1, "View")
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.prompt_plan({"cwd": CWD, "session_id": "pet-plan"}, hook_cfg,
+                      {"title": "Plan ready", "message": "x", "project": "noti"})
+    pmark = m.TALLY_DIR / "pet-plan.deferred"
+    want("plan View writes the deferral marker",
+         pmark.exists() and json.load(open(pmark))["reason"] == "esc")
 finally:
     m.load_config, m.toast_ask, m.acquire_slot, m.release_slot = (
         _load_config, _toast_ask, _acquire_slot, _release_slot)
+    m.TALLY_DIR = _TALLY_SAVE
+
+# Notification/permission_prompt — the flagship gap: the terminal permission
+# dialog is up and noti isn't handling it. The handler must (1) toast the
+# generic copy as kind=note, (2) suppress ONLY a fresh deferral marker and
+# consume it, (3) treat missing/stale/unreadable markers as SHOW (fail-toast),
+# (4) honor the alerts.terminal_prompt kill-switch while STILL standing the
+# pet's summons, and (5) never print or emit a decision.
+np_dir = tempfile.mkdtemp()
+np_cfg = copy.deepcopy(cfg)
+np_cfg["pet"]["enabled"] = True
+np_cfg["pet"]["state_dir"] = np_dir
+np_cfg["pet"]["focus_terminal"] = False      # keep the ps walk out of unit tests
+_lc, _ts, _TALLY_SAVE = m.load_config, m.toast_summary, m.TALLY_DIR
+toasts = []
+try:
+    m.TALLY_DIR = pathlib.Path(tempfile.mkdtemp())
+    m.load_config = lambda: np_cfg
+    m.toast_summary = lambda *a, **kw: toasts.append((a, kw))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    np_state = json.load(open(os.path.join(np_dir, "np-sess.json")))
+    want("permission_prompt with no marker toasts kind=note",
+         rc == 0 and len(toasts) == 1 and toasts[0][1].get("kind") == "note")
+    want("permission_prompt copy names the terminal", "terminal" in toasts[0][0][1])
+    want("permission_prompt stands the pet's waiting summons",
+         np_state["state"] == "waiting")
+    want("permission_prompt prints nothing", buf.getvalue() == "")
+
+    toasts.clear()
+    m.defer_mark("np-sess", "esc")
+    rc = m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    want("fresh esc marker suppresses the toast", rc == 0 and not toasts)
+    m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    want("marker is consumed — the NEXT notification shows", len(toasts) == 1)
+
+    toasts.clear()
+    m.defer_mark("np-sess", "esc")
+    mk = m.TALLY_DIR / "np-sess.deferred"
+    aged = json.load(open(mk)); aged["ts"] -= 60
+    open(mk, "w").write(json.dumps(aged))
+    m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    want("stale marker shows the toast", len(toasts) == 1)
+
+    toasts.clear()
+    open(mk, "w").write("not json")
+    m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    want("unreadable marker shows the toast and is cleared",
+         len(toasts) == 1 and not mk.exists())
+
+    toasts.clear()
+    os.unlink(os.path.join(np_dir, "np-sess.json"))
+    np_cfg["alerts"]["terminal_prompt"] = False
+    m.hook_notification({"cwd": CWD, "session_id": "np-sess"})
+    np_state = json.load(open(os.path.join(np_dir, "np-sess.json")))
+    want("terminal_prompt kill-switch silences the toast but stands the pet",
+         not toasts and np_state["state"] == "waiting")
+    np_cfg["alerts"]["terminal_prompt"] = True
+finally:
+    m.load_config, m.toast_summary, m.TALLY_DIR = _lc, _ts, _TALLY_SAVE
+
+# SECURITY: the marker filename derives from the payload's session_id — the
+# same escape class as the pet/tally files. A crafted sid must neither write
+# nor consume outside TALLY_DIR.
+_TALLY_SAVE = m.TALLY_DIR
+mk_root = tempfile.mkdtemp()
+try:
+    m.TALLY_DIR = pathlib.Path(mk_root) / "tally"
+    m.TALLY_DIR.mkdir()
+    m.defer_mark("../../pwned", "esc")
+    escaped = os.path.exists(os.path.join(mk_root, "..", "..", "pwned.deferred"))
+    landed = list(m.TALLY_DIR.glob("*.deferred"))
+    want("defer_mark sanitizes hostile session_id (no dir escape)",
+         not escaped and len(landed) == 1)
+finally:
+    m.TALLY_DIR = _TALLY_SAVE
 
 # Pet-attached prompts: when a live pet hosts the toast, the interactive card
 # grows out of the crab instead of a separate corner toast. The gate is

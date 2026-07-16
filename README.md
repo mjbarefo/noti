@@ -195,6 +195,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `approval.rule_scope` | `project_local` | where "Always" writes rules: `project_local` / `project` / `global` |
 | `summary.show_tally` | `true` | append `ran N commands · edited M files` |
 | `alerts.stop_failure` | `true` | red toast when a turn dies (rate limit, auth, server error) instead of silence |
+| `alerts.terminal_prompt` | `true` | toast when a permission prompt is waiting in the terminal and noti isn't handling it (toast timed out, or an ungoverned tool); deliberate Esc hand-offs don't echo |
 | `pet.enabled` | `false` | opt into hook state-file writes and `noti pet` |
 | `pet.state_dir` | `~/.config/noti/pet` | per-session pet state files |
 | `pet.done_decay_seconds` | `6` | how long done/failed poses linger before asleep |

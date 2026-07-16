@@ -40,7 +40,7 @@ Verdicts: `shipped` · `adopt-P1` · `adopt-P2` · `investigate` · `skip`.
 |---|---|---|
 | PreToolUse | shipped | The core: approval/question/plan toasts. The only handler that may ever emit a decision (R1). |
 | Stop | shipped | End-of-turn summary + tally. Inert by design — never blocks (R2). |
-| Notification / `permission_prompt` | **adopt-P1** | The flagship gap: when noti falls back (toast timeout, Esc, ungoverned tool) the terminal dialog shows and today the user gets *zero signal* — the exact moment noti exists for. |
+| Notification / `permission_prompt` | **shipped 2026-07-16** | The flagship gap, closed: when noti falls back (toast timeout, Esc, ungoverned tool) a notify-only `note` toast says a permission prompt is waiting. Deliberate hand-offs (Esc, plan View, complex-set notice) dedup via a 10s `.deferred` marker beside the tally — Esc vs timeout told apart by elapsed time, since the binary exits 124 for both. Also stands the pet's `waiting` summons, which covers ungoverned tools. Kill-switch `alerts.terminal_prompt`. |
 | StopFailure (all reasons) | **shipped 2026-07-08** | Turn died on rate-limit/auth/server error; the user waits for a summary toast that never comes. Red `error` toast with reason copy + the dead turn's tally as footer; also stands the pet's `failed` summons. Kill-switch `alerts.stop_failure`. Existing installs need `noti uninstall && noti install` to register the new event. |
 | PostToolUseFailure | **adopt-P2** | Silent tally-only, so the summary can say "· 1 failed" — the difference between "done" and "done, but look". Never a per-failure toast (spam). |
 | Elicitation / ElicitationResult | investigate | An MCP server blocking the session on user input is AskUserQuestion's class, but the contract needs a spike first. |
@@ -91,6 +91,16 @@ Verdicts: `shipped` · `adopt-P1` · `adopt-P2` · `investigate` · `skip`.
   block only when true).
 - Open question: does `permission_prompt` also fire for question/plan terminal
   fallbacks? Keep the copy generic so it's correct either way.
+
+Shipped 2026-07-16 as designed, with two build-time findings: (a) the toast
+binary exits 124 for BOTH Esc and timeout, so the Esc marker is written when
+the toast returned materially faster than its budget (elapsed < timeout−2s) —
+no Swift change needed; (b) question/plan fallbacks mark too (plan **View**
+and an empty free-text submit count as deliberate hand-offs, the complex-set
+notice marks `notice`), so the copy stays correct whether or not the event
+fires for them. The handler also stands the pet's `waiting` summons — that is
+what extends the standing summons (and click-to-focus, captured at
+notification time) to ungoverned tools.
 
 ### StopFailure — the turn died (P1)
 
