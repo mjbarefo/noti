@@ -21,6 +21,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decision. Existing installs: `noti uninstall && noti install` to register
   the new events; `noti doctor` flags the drift.
 
+### Documentation
+- **README screenshots regenerated and completed.** The "What it looks like"
+  grid now includes the pet's standing summons and the turn-died error toast
+  (both palettes), the question card shows its "Other…" row, and every image
+  regenerates from the live binary via `docs/make-screenshots.sh` — the
+  renders were previously hand-run and had silently fallen a release behind.
+
 ## [0.6.0] — 2026-07-16
 
 The pet release: the summons gets somewhere to stand. An opt-in floating

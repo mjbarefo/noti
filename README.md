@@ -76,7 +76,19 @@ Claude Code hooks.
 <sub><b>Summary</b> — the trimmed final message + a tool tally</sub>
 </td>
 </tr>
+<tr>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/summons-dark.png"><img alt="The pet's standing summons: a small robot holding a Claude needs you card that shows how long it has stood" src="docs/summons-light.png" width="288"></picture><br>
+<sub><b>Standing summons</b> (opt-in pet) — persists until answered; click to focus the owning terminal</sub>
+</td>
+<td align="center" width="50%">
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/error-dark.png"><img alt="Red error toast saying the turn ended on a rate limit, with the dead turn's tally" src="docs/error-light.png" width="360"></picture><br>
+<sub><b>Turn died</b> — rate limit, auth, or server error; silence was the old behavior</sub>
+</td>
+</tr>
 </table>
+
+All of these regenerate from the live binary via `docs/make-screenshots.sh`.
 
 <sub>Cards follow the system light/dark palette (shown here in both); the icon
 chip's tint is the risk class, its glyph the tool.</sub>
