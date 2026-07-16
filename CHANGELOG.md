@@ -4,7 +4,14 @@ All notable changes to `noti` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] — 2026-07-16
+
+The pet release: the summons gets somewhere to stand. An opt-in floating
+robot reflects each session's state, presents the live approval/question/plan
+card out of its own body, holds a standing `Claude needs you` card that says
+how long it has stood — and clicking it lands you in the terminal that asked.
+A dead turn (rate limit, auth, server error) finally says so instead of going
+silent.
 
 ### Added
 - **A dead turn now says so (StopFailure).** When a turn dies on a rate
@@ -19,15 +26,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of decaying in 6 seconds. Kill-switch: `alerts.stop_failure`.
   Existing installs: `noti uninstall && noti install` to register the event.
 - **Opt-in pet companion.** `noti pet` starts a small non-activating floating
-  crab that watches best-effort per-session state files. It shares the toasts'
+  robot that watches best-effort per-session state files. It shares the toasts'
   frosted surface and *is* the delivery: on a summons it unfurls one card out of
-  the crab (`Claude needs you · project`), and collapses back to just the crab
+  the robot (`Claude needs you · project`), and collapses back to just the robot
   when running, done, or asleep — never becoming a second decider. Hook writes
   are gated by `pet.enabled: false` by default; failures are debug-only and never
   affect permission decisions. `noti uninstall` also stops a running pet.
 - **Prompts delivered through the pet.** When the pet is running, the interactive
-  approval/question/plan toast now grows *out of the crab* at the pet's spot —
-  the same crab becomes the card's leading icon and the card unfurls from it,
+  approval/question/plan toast now grows *out of the robot* at the pet's spot —
+  the same robot becomes the card's leading icon and the card unfurls from it,
   then retracts back into it when you answer — instead of a separate corner toast
   beside a decorative pet card. It is still the one decider and the one
   keyboard-armed surface (the pet only lends its position and its face); the pet
@@ -87,6 +94,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file disappears (the timer stays as heartbeat and backstop). Everything
   that moves shares one deceleration curve, so concurrent cards read as one
   surface. Reduce-motion keeps the fades and drops the slides.
+- **The robot, machined.** An art pass over the pet's draw path, same
+  silhouette and mood palette: arms and legs are outlined capsules instead of
+  bare strokes, the head and torso carry a shallow top-lit gradient, ear nubs
+  widen the silhouette, the eyes gained pinprick catchlights, and the mouth
+  now agrees with the chest glyph — a smile on `done`, a startled "o" on
+  `failed`. The attached prompt card inherits all of it through the shared
+  renderer.
 
 ### Fixed
 - **Summons text stays on the card for a left-half pet.** The unfurled
@@ -275,7 +289,7 @@ that diagnoses a stranger's most likely install problems.
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
-[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.5.0...HEAD
+[0.6.0]: https://github.com/mjbarefo/noti/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mjbarefo/noti/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjbarefo/noti/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjbarefo/noti/compare/v0.2.0...v0.3.0

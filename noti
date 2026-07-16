@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 # Deployment-target floor for the toast binary. The host toolchain default-
 # targets the build machine's OS (e.g. macosx15), which would stamp a minos the
 # binary refuses to launch under on older Macs — so `noti build` pins this
@@ -159,11 +159,11 @@ DEFAULT_CONFIG = {
         # ask_timeout+30 so a summons can never expire under a live toast.
         "waiting_ttl_seconds": 1800,
         # When the pet is running, deliver the approval/question/plan toast AS
-        # the pet: the interactive card unfurls out of the crab at its spot and
+        # the pet: the interactive card unfurls out of the robot at its spot and
         # occludes it, instead of a separate corner toast plus a decorative pet
         # card. The card is still the sole decider (R1) and sole keyboard surface
         # (R3) — the pet only lends its position and its face. R7 kill-switch:
-        # set false to keep the crab and route prompts to the corner as before.
+        # set false to keep the robot and route prompts to the corner as before.
         "attach_prompts": True,
         # Click-to-focus: clicking the standing summons focuses the terminal
         # tab that owns the oldest waiting session — by TTY for Terminal.app
@@ -315,7 +315,7 @@ def _toast_env(timeout: float, slot, corner: str, hotkeys: bool = True,
         env["NOTI_SLOT_DIR"] = str(SLOT_DIR)
     if attach:
         # Grow out of the pet instead of the corner. The toast reads the pet's
-        # live crab origin from <pet_dir>/.anchor. Attached callers pass slot=None
+        # live robot origin from <pet_dir>/.anchor. Attached callers pass slot=None
         # (no corner column — the pet's spot is the position), so NOTI_SLOT_DIR
         # is absent above and the toast takes its makeCard attach branch.
         env["NOTI_ATTACH"] = "1"
@@ -537,10 +537,10 @@ def pet_record(payload: dict, cfg: dict, state: str) -> None:
 
 def _attach_prompts(cfg: dict) -> bool:
     """True when a running pet should HOST the interactive prompt — the card
-    grows out of the crab at its spot instead of a separate corner toast. Gated
+    grows out of the robot at its spot instead of a separate corner toast. Gated
     on the pet being opt-in-enabled, the attach kill-switch, and a *verified-live*
     pet process: a stale pid must fall back to the corner, never leave a prompt
-    attached to a crab that is not on screen. Cheap and fail-safe — any failure
+    attached to a robot that is not on screen. Cheap and fail-safe — any failure
     (including no pet) yields False, i.e. the unchanged corner toast."""
     try:
         pcfg = cfg.get("pet") or {}

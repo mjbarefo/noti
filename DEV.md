@@ -207,10 +207,10 @@ these govern growth.
 | P2 | Doctor: hook-coverage drift | Compare installed event set against this version's shipped set; "install predates `<event>` — `noti uninstall && noti install`". R6's enforcement arm. |
 | P2 | Opt-in per-toast sound | Accessibility: `toast.sound` (default false). NSSound is AppKit — zero-dep holds. Distinct (or no) sound for summary vs ask, so ask stays salient. |
 | shipped 2026-07-07 | The pet — a standing summons | Opt-in ambient companion: one non-capturing state-file reader, never a toast suppressor. |
-| shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its crab, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
+| shipped 2026-07-07 | Prompts grow out of the pet (`pet.attach_prompts`) | The live ask/question/plan toast attaches to a running pet — wears its robot, occludes it, unfurls/retracts — so the prompt reads as the pet, not a corner toast beside it. Still the sole decider (R1) and keyboard surface (R3). |
 | shipped 2026-07-08 | Summons duration + a real standing summons | The summons card shows how long it has stood (`noti · 4m`); `pet.waiting_ttl_seconds` (default 30 min, clamped ≥ ask_timeout+30) replaces the toast-lifetime bound that retracted the summons 30s after the toast died. |
 | shipped 2026-07-08 | Click-to-focus on the standing summons | Spiked by Codex (`docs/spikes/spike-focus.sh`), then wired: hooks stamp TTY + terminal app via ppid walk on summons writes; a click focuses the Terminal.app tab by tty, activates the app as the floor, does nothing when uncaptured. `pet.focus_terminal` kill-switch. |
-| P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the crab using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
+| P3 | Pet-anchored stacking of concurrent attached prompts | Today a 2nd simultaneous attached prompt overlaps the 1st at the pet (top-answerable first). Stack them downward from the robot using the slot machinery rooted at the anchor, so both are visible — the corner column's behavior, re-based on the pet. |
 | shipped 2026-07-08 | Document `--kind error` | Fell out of StopFailure; README's reusable-primitives styling flags. |
 
 ## The pet — a standing summons (design)
@@ -239,27 +239,27 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   non-activating / all-Spaces NSPanel DNA as the cards, and the *same frosted
   `.popover` surface* (`makeCard`'s material, 16pt continuous corner, hairline
   border) so the pet reads as a member of the toast family, not a separate app
-  icon. Small (72pt crab) at rest; draggable, remembers its corner (re-clamped
+  icon. Small (72pt robot) at rest; draggable, remembers its corner (re-clamped
   on `didChangeScreenParametersNotification` — an undock must not park it
   off-screen). Never the key window (R3), never emits anything (R1). Default
-  character: a little terracotta crab — the identity color already means
+  character: a little terracotta robot — the identity color already means
   "Claude wants me" from across the room.
 - **Singular delivery**: the pet *is* the notification surface, not a mascot
-  beside one. Two things unfurl out of the crab, and neither is a second
+  beside one. Two things unfurl out of the robot, and neither is a second
   decider (R5):
   1. **The live prompt (as built, `pet.attach_prompts`).** When the pet is
      running, `hook_pretooluse` (and the question/plan paths) spawn the *ordinary
      ask toast* in **attached** mode instead of at the corner: the toast wears
-     the same crab as its leading icon, sits so that crab tile lands exactly on
+     the same robot as its leading icon, sits so that robot tile lands exactly on
      the pet's anchor, and — being at least as tall and wide as the 72pt pet tile
      — fully **occludes** the resting pet beneath it. The card grows into the
      screen room the anchor leaves: horizontally away from the nearer edge, and
-     vertically up *or* down (the crab rides the card's top edge at a top-corner
+     vertically up *or* down (the robot rides the card's top edge at a top-corner
      pet, its bottom edge at a bottom-corner pet) so a tall multi-option question
      never centres itself off the screen. A final clamp keeps the whole card in
-     the visible frame even on a small display — trading a few px of crab drift
+     the visible frame even on a small display — trading a few px of robot drift
      (a faint pet ghost) for a card that is always fully visible and answerable. The interactive card unfurls
-     horizontally out of the crab and retracts back into it on answer, revealing
+     horizontally out of the robot and retracts back into it on answer, revealing
      the pet again (now in its post-answer mood) with no handoff seam. This keeps
      R1/R3 intact by construction: the attached card is still the same
      hook-spawned decider process and the only keyboard-armed surface — the pet
@@ -272,11 +272,11 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
      simultaneous prompts-with-a-present-human are rare. Kill-switch back to
      corner toasts: `pet.attach_prompts: false` (R7).
   2. **The standing summons (post-timeout).** If the human is away and the
-     attached prompt times out, the crab keeps the glanceable `Claude needs you ·
+     attached prompt times out, the robot keeps the glanceable `Claude needs you ·
      <project>` (or `· N sessions`) card — the pet's own decorative unfurl, which
      is what the toast was occluding. This is the whole point: a toast is a knock
      you can miss; the pet is its standing form. The card grows into whichever
-     side has room so the crab never leaves its corner. Approve/deny still
+     side has room so the robot never leaves its corner. Approve/deny still
      happens on a toast or in the terminal — the pet only stands there asking.
 - **State feed**: the pet is a long-lived *reader*, never in any hook path.
   Hooks drop per-session, event-stamped state files (`waiting` / `running` /
@@ -299,13 +299,13 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
   writes are best-effort: a failed write degrades to a wrong-mood pet, never
   a blocked session.
 - **States**: *waiting on you* (the live attached prompt is unfurled out of the
-  crab and occluding the pet; once it times out, the pet's own `Claude needs you`
+  robot and occluding the pet; once it times out, the pet's own `Claude needs you`
   card stands in its place, project/count named plus how long it has stood
   (`noti · 4m`, oldest wait when several stand) — the whole point) · *running*
-  (calm resting crab, no words) · *done* (brief ✓, then rest) · *turn failed*
+  (calm resting robot, no words) · *done* (brief ✓, then rest) · *turn failed*
   (alarmed, presents a card, pairs with StopFailure) · *no sessions* (asleep).
   Only a summons (`waiting`/`failed`) presents the card; every resting state
-  stays inert — no counts, no project names — per the charter carve-out. Each state keeps a distinct static crab pose so
+  stays inert — no counts, no project names — per the charter carve-out. Each state keeps a distinct static robot pose so
   reduce-motion loses only the motion — the unfurl and the idle life (beacon
   breath, blink, gaze, sleep-z, mood reactions) — never the meaning. Clicking a standing
   summons focuses the terminal that owns it (answered 2026-07-08 by

@@ -34,17 +34,17 @@ surfaces only the moments a human is actually needed:
    Claude's final message plus what it did (`ran 3 commands · edited 2 files ·
    answered 1 question`), then auto-dismisses (hover to hold it, click to
    dismiss early).
-4. **Pet** — opt-in only: `noti pet` starts a small always-on-top crab on the
+4. **Pet** — opt-in only: `noti pet` starts a small always-on-top robot on the
    same frosted surface as the toasts. When the pet is up, the approval prompt
-   itself grows *out of the crab*: the crab becomes the card's leading icon and
+   itself grows *out of the robot*: the robot becomes the card's leading icon and
    the interactive card unfurls from it at the pet's spot, then retracts back
-   into the crab when you answer — one object, not a toast beside a mascot. If
-   you're away and the prompt times out, the crab keeps the standing summons
-   (`Claude needs you · project`); the rest of the time it rests as just the crab
+   into the robot when you answer — one object, not a toast beside a mascot. If
+   you're away and the prompt times out, the robot keeps the standing summons
+   (`Claude needs you · project`); the rest of the time it rests as just the robot
    (running, done, or asleep). The card is still the sole decider and the sole
    keyboard-armed surface — the pet only lends its position and its face; it
    never answers prompts and never captures the keyboard. Set
-   `pet.attach_prompts: false` to keep the crab but route prompts to the corner.
+   `pet.attach_prompts: false` to keep the robot but route prompts to the corner.
 
 Concurrent toasts (several sessions, an approval plus a summary) stack in one
 packed column and re-pack smoothly as cards dismiss.
@@ -188,7 +188,7 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
 | `pet.done_decay_seconds` | `6` | how long done/failed poses linger before asleep |
 | `pet.waiting_ttl_seconds` | `1800` | how long the standing summons stands when nothing answers (clamped to ≥ `ask_timeout`+30; the card also shows how long it has waited) |
 | `pet.focus_terminal` | `true` | clicking the standing summons focuses the owning Terminal.app tab (by TTY), or activates the owning app; first click may show a one-time Automation consent |
-| `pet.attach_prompts` | `true` | when the pet is running, grow the prompt out of the crab (else corner toast) |
+| `pet.attach_prompts` | `true` | when the pet is running, grow the prompt out of the robot (else corner toast) |
 
 ## Safety notes
 
@@ -274,9 +274,9 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   can never delay or change a permission decision. The pet panel is
   non-activating, cannot become key, and never installs a key monitor. Attaching
   a prompt to the pet does not change this: the interactive card that grows out
-  of the crab is the ordinary approval toast — the sole decider and the sole
+  of the robot is the ordinary approval toast — the sole decider and the sole
   keyboard-armed surface — just positioned over the pet and drawing the same
-  crab. The pet only publishes where it sits; the toast reads that and decides.
+  robot. The pet only publishes where it sits; the toast reads that and decides.
 - "Always" writes the **exact** command/path/domain, never a broadened glob, and
   refuses to write if your settings file is unparseable (it never clobbers it; it
   keeps a `.noti-prev` copy). Commands ending in `*` are never minted at all —
