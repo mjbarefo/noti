@@ -4,6 +4,23 @@ All notable changes to `noti` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The summons now clears when you answer in the terminal.** Answering
+  Claude's own terminal prompt fires no hook, so the pet's `Claude needs you`
+  card only healed on the session's *next* PreToolUse/Stop — which never came
+  when the answer aborted the turn (Esc at the prompt), the approved tool ran
+  long, or the session was closed mid-prompt (leaving a zombie summons that
+  could impersonate a live session with the same project name for the whole
+  30-minute waiting TTL). `noti install` now registers two silent
+  housekeeping hooks: `UserPromptSubmit` marks the session `running` (the
+  human just acted — they are present by definition; the handler prints
+  nothing, since this hook's stdout becomes model context), and `SessionEnd`
+  reaps the ended session's pet state file. Neither ever toasts or emits a
+  decision. Existing installs: `noti uninstall && noti install` to register
+  the new events; `noti doctor` flags the drift.
+
 ## [0.6.0] — 2026-07-16
 
 The pet release: the summons gets somewhere to stand. An opt-in floating
@@ -289,6 +306,7 @@ that diagnoses a stranger's most likely install problems.
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
+[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/mjbarefo/noti/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mjbarefo/noti/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjbarefo/noti/compare/v0.3.0...v0.4.0

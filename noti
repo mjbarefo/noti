@@ -1513,6 +1513,29 @@ def hook_stopfailure(payload: dict) -> int:
         debug(f"stop-failure toast failed: {e}")
     return 0
 
+
+def hook_userpromptsubmit(payload: dict) -> int:
+    """The user typed in this session — they are present by definition, so any
+    standing summons for it is answered. Without this, a summons only healed on
+    the session's next PreToolUse/Stop, which never comes when the terminal
+    answer aborted the turn (Esc at the prompt) or the approved tool runs long.
+    Pure pet housekeeping: never a toast, never a decision (R1), and it must
+    print NOTHING — UserPromptSubmit stdout is injected as model context (R4)."""
+    pet_record(payload, load_config(), "running")
+    return 0
+
+
+def hook_sessionend(payload: dict) -> int:
+    """The session ended — it cannot need anyone. Reap its pet state file so a
+    session closed mid-prompt doesn't leave a zombie summons standing until the
+    waiting TTL (and a zombie sharing a live session's project name looks
+    exactly like the real thing). Silent housekeeping, never a toast."""
+    try:
+        pet_session_path(payload, load_config()).unlink(missing_ok=True)
+    except Exception as e:
+        debug(f"sessionend reap failed: {e}")
+    return 0
+
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
@@ -1585,6 +1608,10 @@ def cmd_hook(a) -> int:
             return hook_stop(payload)
         if a.event == "stopfailure":
             return hook_stopfailure(payload)
+        if a.event == "userpromptsubmit":
+            return hook_userpromptsubmit(payload)
+        if a.event == "sessionend":
+            return hook_sessionend(payload)
     except Exception as e:
         debug(f"hook crash: {e}")                 # a noti bug must not break the session
         return 0
@@ -1683,6 +1710,8 @@ def cmd_install(a) -> int:
     pre_cmd = f"{py} {script} hook pretooluse"
     stop_cmd = f"{py} {script} hook stop"
     fail_cmd = f"{py} {script} hook stopfailure"
+    prompt_cmd = f"{py} {script} hook userpromptsubmit"
+    end_cmd = f"{py} {script} hook sessionend"
     matcher = "|".join(cfg["approval"]["governed_tools"]) + ("|mcp__.*" if cfg["approval"]["govern_mcp"] else "")
     if cfg["approval"].get("surface_questions", True):
         matcher += "|AskUserQuestion"
@@ -1726,6 +1755,11 @@ def cmd_install(a) -> int:
         hooks.setdefault("Stop", []).append(_hook_block(stop_cmd))
         if (cfg.get("alerts") or {}).get("stop_failure", True):
             hooks.setdefault("StopFailure", []).append(_hook_block(fail_cmd))
+        # Pet self-heal housekeeping. Registered unconditionally (not gated on
+        # pet.enabled) so toggling the pet on later doesn't need a reinstall:
+        # with the pet off, both handlers no-op in a few ms and print nothing.
+        hooks.setdefault("UserPromptSubmit", []).append(_hook_block(prompt_cmd))
+        hooks.setdefault("SessionEnd", []).append(_hook_block(end_cmd))
         atomic_write_json(target, data)
     print(f"installed noti hooks into {target}")
     print(f"  PreToolUse matcher: {matcher}")
@@ -1747,7 +1781,7 @@ def cmd_uninstall(a) -> int:
         print(f"no hooks in {target}")
         return 0
     removed = 0
-    for event in ("PreToolUse", "Stop", "StopFailure"):
+    for event in ("PreToolUse", "Stop", "StopFailure", "UserPromptSubmit", "SessionEnd"):
         blocks = data["hooks"].get(event, [])
         kept = []
         for blk in blocks:
@@ -1846,6 +1880,14 @@ def cmd_doctor(a) -> int:
                 (cfg["approval"].get("surface_plans", True) and "ExitPlanMode" not in matcher)
         line("hook matcher current", not stale,
              "matcher predates question/plan surfacing — `noti uninstall && noti install`" if stale else "")
+        # An install predating the pet self-heal hooks leaves a summons
+        # standing after the user answers in the terminal — flag the drift.
+        missing = [ev for ev in ("UserPromptSubmit", "SessionEnd")
+                   if not any("noti" in h.get("command", "")
+                              for blk in gd.get("hooks", {}).get(ev, [])
+                              for h in blk.get("hooks", []))]
+        line("pet self-heal hooks present", not missing,
+             f"missing {'/'.join(missing)} — `noti uninstall && noti install`" if missing else "")
     print(f"  governed: {', '.join(cfg['approval']['governed_tools'])}"
           f"{' + mcp__*' if cfg['approval']['govern_mcp'] else ''}")
     print(f"  ask timeout: {cfg['toast']['ask_timeout_seconds']}s · rule scope: {cfg['approval']['rule_scope']}")
@@ -1892,7 +1934,8 @@ def build_parser() -> argparse.ArgumentParser:
     pet.set_defaults(fn=cmd_pet)
 
     h = sub.add_parser("hook", help="Claude Code hook adapter (reads JSON on stdin)")
-    h.add_argument("event", choices=["pretooluse", "stop", "stopfailure"])
+    h.add_argument("event", choices=["pretooluse", "stop", "stopfailure",
+                                     "userpromptsubmit", "sessionend"])
     h.set_defaults(fn=cmd_hook)
 
     d = sub.add_parser("decide", help="dry-run the policy on stdin JSON (no toast)")

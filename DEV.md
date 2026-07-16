@@ -53,11 +53,11 @@ Verdicts: `shipped` · `adopt-P1` · `adopt-P2` · `investigate` · `skip`.
 | PermissionDenied | skip | Retry-on-deny is policy, not notification; the deny already surfaced. |
 | SubagentStop | skip | Subagent completion is orchestration narration (herdr), and the event is blocking-capable — adopting it would tempt a second decider (R1/R2). |
 | SubagentStart | skip | Pure narration. |
-| SessionEnd | skip | The user ended the session; telling them so is noise. |
+| SessionEnd | **shipped 2026-07-16** | Never a toast (telling the user they ended a session is noise) — but the pet must know: a session closed mid-prompt left a zombie summons standing until the waiting TTL. The handler silently reaps that session's pet state file, nothing else. |
 | PostToolUse | skip | Success narration; the tally already counts intent at PreToolUse time. |
 | PostToolBatch | skip | Batch narration — same reasoning as PostToolUse. |
 | PreCompact / PostCompact | skip | Context logistics — ccbaton's lane. |
-| UserPromptSubmit / UserPromptExpansion | skip | The human just acted, so they are present by definition. Context-injecting, too — extra reason to stay away (R4). |
+| UserPromptSubmit / UserPromptExpansion | **shipped 2026-07-16** (Submit only) | "The human just acted, so they are present by definition" — originally the reason to skip, actually the exact signal that clears a standing summons: answering a terminal prompt fires no hook of its own, so a summons survived an Esc'd turn or a long approved tool. The handler writes `running` for that session and prints nothing (stdout becomes model context — R4 is why it stays silent, not why it stays away). UserPromptExpansion remains skipped. |
 | TeammateIdle | skip | Multi-agent orchestration — herdr's job. |
 | TaskCreated / TaskCompleted | skip | Task-list narration is dashboard territory, explicitly out of charter. |
 | FileChanged | skip | File watching is not approval; PreToolUse already governs the edits Claude makes. |

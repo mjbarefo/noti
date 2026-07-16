@@ -848,6 +848,74 @@ try:
 finally:
     m.load_config, m.toast_summary = _lc, _ts
 
+# Pet self-heal hooks. A summons only used to clear on the session's next
+# PreToolUse/Stop — which never comes when the terminal answer aborted the turn
+# (Esc at the prompt) or the session was closed mid-prompt. UserPromptSubmit
+# ("the human just acted") must overwrite waiting with running, and SessionEnd
+# must reap the session's file entirely. Both are silent housekeeping: they
+# must print NOTHING (UserPromptSubmit stdout becomes model context, R4) and
+# always exit 0.
+heal_dir = tempfile.mkdtemp()
+heal_cfg = copy.deepcopy(cfg)
+heal_cfg["pet"]["enabled"] = True
+heal_cfg["pet"]["state_dir"] = heal_dir
+_lc = m.load_config
+try:
+    m.load_config = lambda: heal_cfg
+    # Stand a summons the way a prompt fallback would, then submit a prompt.
+    m.pet_record({"cwd": CWD, "session_id": "heal-sess"}, heal_cfg, "waiting")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = m.hook_userpromptsubmit({"cwd": CWD, "session_id": "heal-sess"})
+    heal_state = json.load(open(os.path.join(heal_dir, "heal-sess.json")))
+    want("userpromptsubmit heals a standing summons to running",
+         rc == 0 and heal_state["state"] == "running")
+    want("userpromptsubmit prints nothing (stdout becomes model context)",
+         buf.getvalue() == "")
+
+    # SessionEnd reaps exactly its own session's file, never a sibling's.
+    m.pet_record({"cwd": CWD, "session_id": "end-sess"}, heal_cfg, "waiting")
+    m.pet_record({"cwd": CWD, "session_id": "bystander"}, heal_cfg, "waiting")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = m.hook_sessionend({"cwd": CWD, "session_id": "end-sess"})
+    want("sessionend reaps the ended session's summons",
+         rc == 0 and not os.path.exists(os.path.join(heal_dir, "end-sess.json")))
+    want("sessionend leaves other sessions' state alone",
+         os.path.exists(os.path.join(heal_dir, "bystander.json")))
+    want("sessionend prints nothing", buf.getvalue() == "")
+    want("sessionend of an unknown session still exits 0",
+         m.hook_sessionend({"session_id": "never-seen"}) == 0)
+
+    # Disabled pet: userpromptsubmit must write nothing at all.
+    off_dir = tempfile.mkdtemp()
+    off_cfg = copy.deepcopy(cfg)
+    off_cfg["pet"]["enabled"] = False
+    off_cfg["pet"]["state_dir"] = off_dir
+    m.load_config = lambda: off_cfg
+    rc = m.hook_userpromptsubmit({"cwd": CWD, "session_id": "off-sess"})
+    want("userpromptsubmit with pet disabled writes no state",
+         rc == 0 and os.listdir(off_dir) == [])
+finally:
+    m.load_config = _lc
+
+# SECURITY: sessionend unlinks a path derived from the payload's session_id.
+# A crafted id must never delete a file outside pet.state_dir.
+reap_dir = tempfile.mkdtemp()
+reap_cfg = copy.deepcopy(cfg)
+reap_cfg["pet"]["enabled"] = True
+reap_cfg["pet"]["state_dir"] = os.path.join(reap_dir, "state")
+os.makedirs(reap_cfg["pet"]["state_dir"])
+decoy = os.path.join(reap_dir, "decoy.json")
+open(decoy, "w").write("{}")
+_lc = m.load_config
+try:
+    m.load_config = lambda: reap_cfg
+    m.hook_sessionend({"session_id": "../decoy"})
+    want("sessionend can't unlink outside pet.state_dir", os.path.exists(decoy))
+finally:
+    m.load_config = _lc
+
 # A hostile session_id (semi-trusted hook payload) must never place a state file
 # outside pet.state_dir, and must always yield a non-empty sanitized name.
 hostile_cfg = copy.deepcopy(cfg)
