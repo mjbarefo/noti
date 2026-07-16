@@ -1200,16 +1200,21 @@ func drawRobot(in square: NSRect, mood: PetMood, cardSide: CardSide, beaconGlow:
     let head = NSRect(x: cx - 17, y: y0 + 36, width: 34, height: 22)
     let body = NSRect(x: cx - 12, y: y0 + 16, width: 24, height: 17)
 
-    // Legs sit behind the body.
-    petLimb(NSRect(x: cx - 6, y: y0 + 6, width: 3.6, height: 11), color: edge)
-    petLimb(NSRect(x: cx + 2.4, y: y0 + 6, width: 3.6, height: 11), color: edge)
+    // Legs sit behind the body — chassis-colored like the arms, so all four
+    // limbs read as parts of one machine instead of dark pins under it.
+    petLimb(NSRect(x: cx - 7, y: y0 + 6, width: 4.6, height: 11), fill: chassis, edge: edge)
+    petLimb(NSRect(x: cx + 2.4, y: y0 + 6, width: 4.6, height: 11), fill: chassis, edge: edge)
 
     // The arm on the card side raises to point at the message it presents — the
     // robot's "here — look" gesture toward whatever card just unfurled beside it.
     petArm(shoulder: NSPoint(x: body.minX, y: body.midY + 2), dir: -1,
-           raised: cardSide == .left, color: chassis)
+           raised: cardSide == .left, color: chassis, edge: edge)
     petArm(shoulder: NSPoint(x: body.maxX, y: body.midY + 2), dir: 1,
-           raised: cardSide == .right, color: chassis)
+           raised: cardSide == .right, color: chassis, edge: edge)
+
+    // Ear nubs peek out from behind the head — silhouette, drawn before it.
+    petLimb(NSRect(x: head.minX - 2.5, y: head.midY - 3, width: 4, height: 6), fill: chassis, edge: edge)
+    petLimb(NSRect(x: head.maxX - 1.5, y: head.midY - 3, width: 4, height: 6), fill: chassis, edge: edge)
 
     // Neck bridge, then body and head over it.
     chassis.setFill()
@@ -1236,7 +1241,7 @@ func drawRobot(in square: NSRect, mood: PetMood, cardSide: CardSide, beaconGlow:
         } else {
             petEyes(head: head, ink: ink, gaze: cardSide)
         }
-        petMouth(head: head, ink: ink)
+        petMouth(head: head, ink: ink, mood: mood)
     }
 
     // Terminal states ride a glyph on the chest.
@@ -1263,34 +1268,52 @@ private func petText(_ text: String, in rect: NSRect, size: CGFloat, color: NSCo
     ])
 }
 
-// A filled, rounded chassis panel (head or body) with a darker outline so the
-// solid terracotta reads as a machined part rather than a flat blob.
+// A rounded chassis panel (head or body): a shallow top-lit gradient plus the
+// darker outline, so the terracotta reads as a machined part with one light
+// source instead of a flat sticker. Shallow on purpose — at 72pt a strong
+// gradient turns to banding.
 private func fillChassis(_ rect: NSRect, radius: CGFloat, color: NSColor, edge: NSColor) {
     let p = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-    color.setFill()
-    p.fill()
+    let lit = color.highlight(withLevel: 0.14) ?? color
+    let dim = color.shadow(withLevel: 0.08) ?? color
+    if let g = NSGradient(starting: lit, ending: dim) {
+        g.draw(in: p, angle: -90)
+    } else {
+        color.setFill()
+        p.fill()
+    }
     edge.setStroke()
     p.lineWidth = 1.5
     p.stroke()
 }
 
-// A capsule limb (leg). Width/2 corner radius makes the ends round.
-private func petLimb(_ rect: NSRect, color: NSColor) {
-    color.setFill()
-    NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2).fill()
+// A capsule limb (leg / ear nub): chassis fill under a hairline of the edge
+// tone, the same fill-plus-outline treatment as the head and body panels.
+private func petLimb(_ rect: NSRect, fill: NSColor, edge: NSColor) {
+    let p = NSBezierPath(roundedRect: rect, xRadius: rect.width / 2, yRadius: rect.width / 2)
+    fill.setFill()
+    p.fill()
+    edge.setStroke()
+    p.lineWidth = 1
+    p.stroke()
 }
 
 // One arm. `dir` is -1 for the left arm, +1 for the right. A raised arm angles up
-// and out toward a presented card; a resting arm hangs a touch below the shoulder.
-private func petArm(shoulder: NSPoint, dir: CGFloat, raised: Bool, color: NSColor) {
+// and out toward a presented card; a resting arm hangs below the shoulder. Drawn
+// as two round-cap strokes — edge under chassis — so the arm is an outlined
+// capsule like every other part; the body painted after covers the shoulder seam.
+private func petArm(shoulder: NSPoint, dir: CGFloat, raised: Bool, color: NSColor, edge: NSColor) {
     let tip = raised
-        ? NSPoint(x: shoulder.x + dir * 8, y: shoulder.y + 9)
-        : NSPoint(x: shoulder.x + dir * 7, y: shoulder.y - 2)
+        ? NSPoint(x: shoulder.x + dir * 9, y: shoulder.y + 10)
+        : NSPoint(x: shoulder.x + dir * 6, y: shoulder.y - 4)
     let arm = NSBezierPath()
     arm.move(to: shoulder)
     arm.line(to: tip)
-    arm.lineWidth = 4
     arm.lineCapStyle = .round
+    arm.lineWidth = 7
+    edge.setStroke()
+    arm.stroke()
+    arm.lineWidth = 4.5
     color.setStroke()
     arm.stroke()
 }
@@ -1335,13 +1358,17 @@ private func petGazeShift(_ gaze: CardSide) -> CGFloat {
     }
 }
 
-// Two open LED eyes in the upper face, glancing toward `gaze`.
+// Two open LED eyes in the upper face, glancing toward `gaze`. Each carries a
+// pinprick catchlight in its upper-outer corner — the one dot that makes the
+// eyes read as lit glass instead of punched holes.
 private func petEyes(head: NSRect, ink: NSColor, gaze: CardSide) {
-    ink.setFill()
     let dx = petGazeShift(gaze)
     for x in [head.midX - 9 + dx, head.midX + 4 + dx] {
+        ink.setFill()
         NSBezierPath(roundedRect: NSRect(x: x, y: head.midY - 1, width: 5, height: 7),
                      xRadius: 2, yRadius: 2).fill()
+        NSColor.white.withAlphaComponent(0.85).setFill()
+        NSBezierPath(ovalIn: NSRect(x: x + 2.5, y: head.midY + 3.2, width: 1.7, height: 1.7)).fill()
     }
 }
 
@@ -1356,11 +1383,31 @@ private func petClosedEyes(head: NSRect, ink: NSColor, gaze: CardSide) {
     }
 }
 
-// A neutral mouth line low on the face; faint so the eyes and beacon lead.
-private func petMouth(head: NSRect, ink: NSColor) {
-    ink.withAlphaComponent(0.5).setFill()
-    NSBezierPath(roundedRect: NSRect(x: head.midX - 6, y: head.minY + 5, width: 12, height: 2),
-                 xRadius: 1, yRadius: 1).fill()
+// The mouth low on the face; faint so the eyes and beacon lead. Mood bends it:
+// a small smile when done, a startled "o" when a turn failed, and the neutral
+// line everywhere else — the face agrees with the chest glyph instead of
+// staying deadpan under it.
+private func petMouth(head: NSRect, ink: NSColor, mood: PetMood) {
+    let tone = ink.withAlphaComponent(0.55)
+    switch mood {
+    case .done:
+        let smile = NSBezierPath()
+        smile.move(to: NSPoint(x: head.midX - 5, y: head.minY + 8))
+        smile.curve(to: NSPoint(x: head.midX + 5, y: head.minY + 8),
+                    controlPoint1: NSPoint(x: head.midX - 2.5, y: head.minY + 4.5),
+                    controlPoint2: NSPoint(x: head.midX + 2.5, y: head.minY + 4.5))
+        smile.lineWidth = 2
+        smile.lineCapStyle = .round
+        tone.setStroke()
+        smile.stroke()
+    case .failed:
+        tone.setFill()
+        NSBezierPath(ovalIn: NSRect(x: head.midX - 2.5, y: head.minY + 3.5, width: 5, height: 5)).fill()
+    default:
+        tone.setFill()
+        NSBezierPath(roundedRect: NSRect(x: head.midX - 6, y: head.minY + 5, width: 12, height: 2),
+                     xRadius: 1, yRadius: 1).fill()
+    }
 }
 
 // The beacon breathes only in states that want your eye: a slow "thinking"
