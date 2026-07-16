@@ -4,7 +4,11 @@ All notable changes to `noti` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] — 2026-07-16
+
+The patch v0.6.0 taught us to need: a standing summons must stand *down* the
+moment you act. Answering in the terminal now clears the pet's card
+immediately, and closed sessions can no longer leave zombie summonses.
 
 ### Fixed
 - **The summons now clears when you answer in the terminal.** Answering
@@ -313,7 +317,7 @@ that diagnoses a stranger's most likely install problems.
 - CLI primitives (`noti ask` / `noti notify`) any script or agent can call, plus
   `build` / `install` / `uninstall` / `doctor`.
 
-[Unreleased]: https://github.com/mjbarefo/noti/compare/v0.6.0...HEAD
+[0.6.1]: https://github.com/mjbarefo/noti/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/mjbarefo/noti/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mjbarefo/noti/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjbarefo/noti/compare/v0.3.0...v0.4.0
