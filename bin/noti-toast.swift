@@ -363,6 +363,32 @@ func attachLayout(_ spec: AttachSpec, cardW W: CGFloat, cardH H: CGFloat) -> Att
     return AttachLayout(robotOnLeft: robotOnLeft, robotY: robotY, origin: origin)
 }
 
+// The material's BACKDROP — and the window shadow that hugs it — is shaped by
+// NSVisualEffectView.maskImage, not by layer.cornerRadius: the layer clip
+// rounds the tint and content, but with .behindWindow blending the blur
+// region underneath stays a full rectangle, which reads as a faint square rim
+// behind the card (stark white against a light desktop). The mask is rendered
+// from a CALayer with the SAME continuous corner curve as the clip so the two
+// shapes agree to the pixel, and capInsets-stretched so one image fits every
+// card size without distorting the corners.
+func roundedBackdropMask(radius: CGFloat) -> NSImage {
+    let edge = radius * 2 + 2
+    let shape = CALayer()
+    shape.frame = NSRect(x: 0, y: 0, width: edge, height: edge)
+    shape.backgroundColor = NSColor.black.cgColor
+    shape.cornerRadius = radius
+    shape.cornerCurve = .continuous
+    let img = NSImage(size: shape.frame.size, flipped: false) { _ in
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+        shape.render(in: ctx)
+        return true
+    }
+    img.capInsets = NSEdgeInsets(top: radius + 1, left: radius + 1,
+                                 bottom: radius + 1, right: radius + 1)
+    img.resizingMode = .stretch
+    return img
+}
+
 func makeCard(width: CGFloat, height: CGFloat, attach layout: AttachLayout? = nil) -> (NSPanel, HoverEffectView) {
     let robotW: CGFloat = layout != nil ? petTileSize : 0
     let panel = KeyablePanel(contentRect: NSRect(x: 0, y: 0, width: width + robotW, height: height),
@@ -387,6 +413,7 @@ func makeCard(width: CGFloat, height: CGFloat, attach layout: AttachLayout? = ni
     vev.layer?.masksToBounds = true
     vev.layer?.borderWidth = 1
     vev.layer?.borderColor = hairline.cgColor     // definition against busy backdrops
+    vev.maskImage = roundedBackdropMask(radius: 16)  // shapes the backdrop + shadow
     panel.contentView = vev
 
     if let layout {
@@ -2304,6 +2331,7 @@ func makePetPanel() -> PetChrome {
     surface.layer?.masksToBounds = true
     surface.layer?.borderWidth = 1
     surface.layer?.borderColor = hairline.cgColor
+    surface.maskImage = roundedBackdropMask(radius: 16)  // shapes the backdrop + shadow
     panel.contentView = surface
 
     let pet = PetView(frame: NSRect(origin: .zero, size: tile))
