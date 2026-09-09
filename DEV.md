@@ -95,16 +95,20 @@ the moments auto mode escalates.
 
 ## Policy corrections
 
-Five defects found 2026-09-09 against Claude Code 2.1.266. C1 is the reckoning
-above reduced to a code change. C2–C5 are matcher drift: noti's rule engine and
-Claude's have diverged, and in three of them noti is *broader* than Claude —
-the one direction CLAUDE.md names as never safe. C2 and C3 are live in any
-install with a prefix rule, in every permission mode, and are not covered by
-`test.sh`.
+Six defects against Claude Code 2.1.266 — five found 2026-09-09, and C6 found
+while fixing C2. C1 is the reckoning above reduced to a code change. C2–C6 are
+matcher drift: noti's rule engine and Claude's have diverged, and in four of
+them noti is *broader* than Claude — the one direction CLAUDE.md names as never
+safe. C2 and C3 were live in any install with a prefix rule, in every
+permission mode, and were not covered by `test.sh`.
 
 Ship order follows the tags, not the numbering: C2/C3 first (exploitable
 today, in every permission mode), then C1 (the clunk), then C4, then C5. Each lands with the regression tests named below; per
 CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
+
+**Status: C2 and C3 shipped 2026-09-09** (`_bash_allow_parts` /
+`_bash_deny_parts` / `_bash_rule_hit`, 30 new regression assertions). C6 was found
+while fixing them and is not yet scheduled. C1, C4, C5 remain open.
 
 ### C1 — auto mode must defer, not prompt (P0)
 
@@ -156,6 +160,30 @@ CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
 - **Tests**: each of the three reproductions above pins to `prompt`; a genuine
   single command still allows; `git log --oneline && git status` allows only
   when both subcommands match; a dangling `npm test &&` never allows.
+- **Shipped 2026-09-09.** `_bash_allow_parts` is a quote-aware scanner that
+  splits on the documented separators and returns `None` — fail closed — for a
+  dangling separator, an unbalanced quote, a trailing backslash, or any
+  unquoted `` ` `` / `(`. Substitutions and subshells are refused rather than
+  descended into: picking which half of `ls -la $(curl evil.com)` a rule covers
+  is not noti's call, and refusing is the strict direction.
+- **Two decisions taken during the fix, neither in the original spec:**
+  - *Coverage spans the rule set, not one rule.* Claude requires each
+    subcommand to match **some** rule, not the same one, so `git log && git
+    status` is granted by the pair `Bash(git log:*)` + `Bash(git status:*)`.
+    Implemented in `matches_any`, not `pattern_matches` — the two now answer
+    different questions (*does this rule cover the command* vs *does the rule
+    set*), and both are pinned by tests.
+  - *`make_rule` refuses compound commands* in both always-modes. Exact minting
+    would write a rule that can never match again; prefix minting would grant
+    every command sharing the head. Refusing is what keeps the mint/match
+    round-trip true now that the matcher splits — "Always" degrades to a
+    one-time "Yes", and the prompt flow already hides the button off that
+    `None`.
+- **Measured cost**: over 130 unique Bash calls from real transcripts, calls
+  auto-allowed by a rule fell 48 → 20. All 28 are genuine compound commands
+  with a subcommand no rule covers (`echo`, `head`, `wc`, `git tag`). These are
+  not new toasts so much as restored ones: Claude would have prompted for every
+  one, and noti was suppressing it. C1 makes the point moot in auto mode.
 
 ### C3 — compound commands: deny and ask rules under-match (P0, security)
 
@@ -172,6 +200,42 @@ CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
   parse is uncertain, deny.
 - **Tests**: `Bash(rm *)` denies `ls && rm -rf ~`, `echo $(rm -rf /)`, and a
   `for` loop body containing `rm`; the existing bare-`*` deny cases still pass.
+- **Shipped 2026-09-09.** `_bash_deny_parts` splits crudely and deliberately
+  *ignores quoting*, then peels control-flow keywords and a leading `VAR=` off
+  each fragment. Crude can only ever yield more candidates than a real parse,
+  and the raw command is always included in the list, so this is provably never
+  narrower than the whole-string matcher it replaces. It over-denies on a
+  denied verb inside a quoted string (`echo "; rm -rf /"`) — the safe direction,
+  and the reason the deny path is not simply the allow scanner run backwards.
+
+### C6 — redirection turns a read-only allow rule into a write (P1, security)
+
+Found 2026-09-09 while fixing C2; **not** covered by the C2/C3 fix, which
+splits on command separators only.
+
+- **noti**: `>` and `>>` are not separators, so the whole string stays one
+  subcommand and matches on its verb. Confirmed against a rule set of exactly
+  one rule:
+
+  ```
+  ls -la > ~/.zshrc                      vs Bash(ls -la:*)   -> allow
+  git log --oneline >> ~/.ssh/authorized_keys vs Bash(git log:*) -> allow
+  ```
+
+- **Severity**: an allow rule for a read-only verb grants an arbitrary file
+  write. Narrower than C2 — it needs a user-authored allow rule on the verb,
+  and the safe-list path is already immune (`_BASH_META` covers `<` and `>`, so
+  `bash_safe_commands` never sees a redirect). But the shape is the one CLAUDE.md
+  calls never safe: noti broader than the verb the user approved.
+- **Open question before fixing**: whether Claude's own matcher treats a
+  redirect as part of the subcommand. If it does, fixing this makes noti
+  stricter than Claude — allowed, but it costs toasts on `cmd > /tmp/out`, which
+  is common. Verify against the live engine before choosing.
+- **Fix (proposed)**: treat an unquoted `>`, `>>`, `<`, `<>`, or `N>` as ending
+  the subcommand for allow matching, so the redirect target is a part no rule
+  covers and the call falls through to a toast. Deny matching needs no change.
+- **Tests**: `ls -la > ~/.zshrc` does not allow under `Bash(ls -la:*)`; a
+  quoted `echo "a > b"` still allows; deny behavior is unchanged.
 
 ### C4 — `permissions.ask` is invisible to noti (P1, security)
 
@@ -181,8 +245,8 @@ CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
   merely ignored — it loses to noti's safe-list, so a call the user explicitly
   marked "always ask me" auto-allows silently. An ask rule on `Bash(grep *)`
   is defeated by the `grep` entry in `bash_safe_commands`.
-- **Fix**: load `ask` as a third pattern kind, matched with C3's any-subcommand
-  semantics, checked after deny and before every allow path *and* before the
+- **Fix**: load `ask` as a third pattern kind, matched with `_bash_deny_parts`
+  (C3's any-subcommand semantics, shipped and ready to reuse), checked after deny and before every allow path *and* before the
   safe-list. An ask match forces the toast; it must never auto-allow.
 - **Tests**: an ask rule beats the safe-list, beats an allow rule, and loses to
   a deny rule — the full precedence ladder pinned in one case each.
