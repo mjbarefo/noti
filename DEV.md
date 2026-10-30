@@ -120,6 +120,7 @@ below; C5's independent allow-filter work remains open (C1 avoids it in auto).
 | 1 — C1 | `noti`, `test.sh`, `README.md`, `DEV.md` | Add auto deferral in `evaluate()` after deny. Test Bash/Edit/Write/MultiEdit/NotebookEdit/WebFetch/MCP, safe-list and saved-allow bypass prevention, question/plan surfaces, deny precedence, and empty hook stdout with no toast. |
 | 2 — C4 | `noti`, `test.sh`, `README.md`, `DEV.md` | Request `ask` patterns in `evaluate()` and match with `broad=True` before any allow. Suppress Always in `hook_pretooluse()` for forced asks. Test real settings loading, deny > ask > allow/safe-list, mode handling, nested Bash, one-time Yes/No, rogue Always, UI/settings failures, and ordinary Always. |
 | 3 — C6 gate | `test.sh`, `DEV.md`, `docs/c6-matcher-verification.md` | Preserve the Bash scanner and matcher. Pin existing safe-list rejection, quoted/escaped controls, and deny coverage. Record live native-matcher results before choosing redirect behavior. |
+| 4 — CI compatibility | `test.sh`, `DEV.md` | macOS CI exposed Python's removal of `SourceFileLoader.load_module`. Replace the two test imports with `module_from_spec` / `exec_module`, without changing assertions or runtime code. |
 
 Every implementation commit runs `ruff check noti` and `./test.sh` through the
 pre-commit gate. No Swift/UI source change is needed. These patches are on the

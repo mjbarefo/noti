@@ -72,7 +72,10 @@ echo "rule round-trip (an 'Always' rule must match the next identical call)"
 python3 - "$CWD" <<'PY'
 import sys
 from importlib.machinery import SourceFileLoader
-m = SourceFileLoader("notimod", "./noti").load_module()
+from importlib.util import module_from_spec, spec_from_loader
+loader = SourceFileLoader("notimod", "./noti")
+m = module_from_spec(spec_from_loader(loader.name, loader))
+loader.exec_module(m)
 cfg = m.load_config()
 cases = [
     ("Bash", {"command": "npm run build"}),
@@ -96,8 +99,11 @@ echo "security regressions (fixed review findings must stay fixed)"
 python3 - "$CWD" <<'PY'
 import sys, copy, io, contextlib
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 from unittest.mock import patch
-m = SourceFileLoader("notimod", "./noti").load_module()
+loader = SourceFileLoader("notimod", "./noti")
+m = module_from_spec(spec_from_loader(loader.name, loader))
+loader.exec_module(m)
 cfg = m.load_config()
 bad = 0
 def want(name, cond):
