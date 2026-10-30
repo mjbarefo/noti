@@ -108,8 +108,8 @@ CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
 
 **Status: C2 and C3 shipped 2026-09-09** (`_bash_allow_parts` /
 `_bash_deny_parts` / `_bash_rule_hit`, 30 new regression assertions). C6 was found
-while fixing them and is not yet scheduled. C1 is implemented below; C4 and C5
-remain open.
+while fixing them and still requires live verification. C1 and C4 are implemented
+below; C5's independent allow-filter work remains open (C1 avoids it in auto).
 
 ### C1 — auto mode must defer, not prompt (P0)
 
@@ -135,7 +135,8 @@ remain open.
   path. `test.sh` covers every governed tool family, safe-listed commands,
   explicit allow rules, the deny floor, question/plan surfaces, and a hook that
   exits 0 with empty stdout, no toast/slot, and a running pet state. This also
-  avoids C5's auto-mode allow-rule bypass; explicit ask handling follows in C4.
+  avoids C5's auto-mode allow-rule bypass. C4 adds the explicit-ask exception:
+  auto defers only when neither deny nor ask matches.
 
 ### C2 — compound commands: allow rules over-match (P0, security)
 
@@ -256,6 +257,15 @@ splits on command separators only.
   safe-list. An ask match forces the toast; it must never auto-allow.
 - **Tests**: an ask rule beats the safe-list, beats an allow rule, and loses to
   a deny rule — the full precedence ladder pinned in one case each.
+- **Implemented 2026-10-30.** `load_patterns` already accepted a kind argument;
+  the evaluator now requests `ask` from the same user/project/local files and
+  uses `broad=True` for C3's any-subcommand semantics. Ask precedes acceptEdits,
+  auto/bypass deferral, saved allows, and both safe-lists. Plan and dontAsk still
+  defer after deny: Claude owns their read-only gate and no-prompt denial.
+  The ask toast offers only Yes/No; an unsolicited Always response falls back
+  to the terminal without saving or approving anything. Ordinary prompts keep
+  Always. Tests cover real hierarchy loading, precedence, nested Bash, all
+  governed tool families, hook answers, UI failure, and no persisted ask grant.
 
 ### C5 — noti honors allow rules that auto mode deliberately drops (P2)
 

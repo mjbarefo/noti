@@ -666,7 +666,7 @@ def settings_files(cwd: str):
 
 
 def load_patterns(cwd: str, kind: str):
-    """kind = 'allow' | 'deny'. Merge across the settings hierarchy."""
+    """kind = 'allow' | 'ask' | 'deny'. Merge across the settings hierarchy."""
     out = []
     for f in settings_files(cwd):
         data = read_json(f, {})
@@ -899,8 +899,8 @@ def _host_match(host: str, dom: str) -> bool:
 
 
 def pattern_matches(tool: str, tinput: dict, pat: str, cwd: str = "", broad: bool = False) -> bool:
-    # broad=True is DENY matching: match if ANY subcommand hits, and widen a bare
-    # trailing * to a prefix, so noti can't under-match and bypass a deny.
+    # broad=True is DENY/ASK matching: match if ANY subcommand hits, and widen a
+    # bare trailing * to a prefix, so noti can't bypass an explicit restriction.
     # broad=False is ALLOW matching: EVERY subcommand must hit (see _bash_match).
     cwd = cwd or os.getcwd()
     if "(" not in pat:
@@ -1196,11 +1196,25 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd, broad=True):
         return {"action": "deny", "reason": "noti: matches a deny rule"}
 
-    # 3. Respect the user's chosen permission mode (after deny). PreToolUse
-    #    precedes auto's classifier: a toast invents a prompt, and an allow
-    #    replaces a better-informed decision. Defer without emitting either.
-    #    dontAsk means "never prompt me" — noti must not toast either.
-    if mode in ("bypassPermissions", "plan", "dontAsk", "auto"):
+    # 3. Plan's read-only gate and dontAsk's no-prompt policy belong to Claude.
+    #    Defer even an ask match there, never approve a plan-mode write or turn
+    #    dontAsk's native denial into a permission toast.
+    if mode in ("plan", "dontAsk"):
+        return {"action": "defer", "reason": f"noti: {mode} mode"}
+
+    #    Explicit ask outranks every allow path, including mode shortcuts and
+    #    the safe-list. Use deny's ANY-subcommand matching, not allow's ALL.
+    #    A standing allow cannot override ask, so offer one-time answers only.
+    if matches_any(tool, tinput, load_patterns(cwd, "ask"), cwd, broad=True):
+        kind, title, message = render_call(tool, tinput)
+        return {"action": "prompt", "reason": "noti: matches an ask rule",
+                "kind": kind, "title": title, "message": message,
+                "project": os.path.basename(cwd.rstrip("/")), "allow_always": False}
+
+    #    PreToolUse precedes auto's classifier: a routine toast invents a
+    #    prompt, and an allow replaces a better-informed decision. After deny
+    #    and explicit ask, leave auto and bypass entirely to Claude.
+    if mode in ("bypassPermissions", "auto"):
         return {"action": "defer", "reason": f"noti: {mode} mode"}
 
     # 4. acceptEdits: Claude already auto-accepts edits — don't nag.
@@ -1573,13 +1587,14 @@ def hook_pretooluse(payload: dict) -> int:
         return 0
 
     # action == "prompt": show the toast. Offer "Always" only when make_rule
-    # can actually mint a rule for this exact call: where minting refuses
-    # (trailing *, multiline/oversized commands), the button would LOOK like a
+    # can actually mint a rule for this exact call, and no ask rule forces a
+    # one-time decision: a saved allow would never override that ask. Where
+    # minting refuses (trailing *, multiline/oversized commands), it would LOOK like a
     # standing grant while silently downgrading to a one-time Yes — a button
     # that does less than it says is a lie. Dispatch below is by label, so a
     # two-button card needs no exit-code remapping.
-    mintable = make_rule(payload.get("tool_name", ""),
-                         payload.get("tool_input", {}) or {}, cfg) is not None
+    mintable = d.get("allow_always", True) and make_rule(
+        payload.get("tool_name", ""), payload.get("tool_input", {}) or {}, cfg) is not None
     # Attached prompts grow out of the pet at its spot; unattached ones join the
     # corner column. Only the corner path needs a slot (attached cards don't
     # stack there), so acquire one only when not attaching.
@@ -1606,7 +1621,7 @@ def hook_pretooluse(payload: dict) -> int:
         tally_record(payload)
         pet_record(payload, cfg, "running")
         emit_pretool("allow", "noti: approved")
-    elif choice == "always":
+    elif choice == "always" and mintable:
         rule = make_rule(payload.get("tool_name", ""), payload.get("tool_input", {}) or {}, cfg)
         if rule:
             try:

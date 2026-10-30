@@ -377,6 +377,115 @@ try:
 finally:
     m.load_patterns = orig
 
+# C4: ask uses deny's ANY-subcommand semantics and outranks every allow path.
+ask_payload = {"tool_name": "Bash", "tool_input": {"command": "grep foo bar"},
+               "permission_mode": "default", "cwd": sys.argv[1], "session_id": "ask-rule"}
+ask_rules = {"ask": ["Bash(grep *)"]}
+with patch.object(m, "load_patterns", side_effect=lambda cwd, kind: ask_rules.get(kind, [])):
+    want("ask beats the read-only safe-list",
+         m.evaluate(ask_payload, cfg)["action"] == "prompt")
+    ask_rules["allow"] = ["Bash"]
+    for mode in ("default", "auto", "acceptEdits", "bypassPermissions"):
+        ad = m.evaluate(dict(ask_payload, permission_mode=mode), cfg)
+        want(f"ask beats safe-list/allow/mode in {mode}",
+             ad["action"] == "prompt" and ad.get("allow_always") is False)
+    for mode in ("plan", "dontAsk"):
+        ad = m.evaluate(dict(ask_payload, permission_mode=mode), cfg)
+        want(f"ask leaves {mode} to Claude", ad["action"] == "defer")
+    for command in ("git status && grep foo bar", "echo $(grep foo bar)",
+                    "echo `grep foo bar`", "for f in *; do grep foo $f; done",
+                    "(grep foo bar)", "FOO=1 grep foo bar"):
+        ad = m.evaluate(dict(ask_payload, tool_input={"command": command}), cfg)
+        want(f"ask finds nested command: {command}",
+             ad["action"] == "prompt" and ad.get("allow_always") is False)
+    ask_rules["deny"] = ["Bash(grep *)"]
+    for mode in ("default", "auto", "acceptEdits", "bypassPermissions", "plan", "dontAsk"):
+        ad = m.evaluate(dict(ask_payload, permission_mode=mode), cfg)
+        want(f"deny beats ask in {mode}", ad["action"] == "deny")
+
+ask_cases = [
+    ("Edit", {"file_path": sys.argv[1] + "/x"}, "Edit", "acceptEdits"),
+    ("Write", {"file_path": sys.argv[1] + "/x"}, "Edit(/x)", "acceptEdits"),
+    ("MultiEdit", {"file_path": sys.argv[1] + "/x"}, "Edit(/x)", "acceptEdits"),
+    ("NotebookEdit", {"notebook_path": sys.argv[1] + "/x.ipynb"}, "Edit(/x.ipynb)", "acceptEdits"),
+    ("WebFetch", {"url": "https://github.com/x"}, "WebFetch(domain:github.com)", "auto"),
+    ("mcp__db__get_rows", {}, "mcp__db", "default"),
+    ("mcp__db__get_rows", {}, "mcp__db__get_*", "auto"),
+    ("Bash", {"command": "grepfoo"}, "Bash(grep*)", "default"),
+]
+for tool, ti, rule, mode in ask_cases:
+    with patch.object(m, "load_patterns", side_effect=lambda cwd, kind:
+                      [rule] if kind == "ask" else [tool] if kind == "allow" else []):
+        ad = m.evaluate({"tool_name": tool, "tool_input": ti,
+                         "permission_mode": mode, "cwd": sys.argv[1]}, auto_cfg)
+        want(f"ask covers {tool} via {rule}", ad["action"] == "prompt")
+
+# Exercise the real settings hierarchy, not only a mocked loader: all three
+# scopes contribute ask rules, and non-string entries can't turn into patterns.
+with tempfile.TemporaryDirectory() as root:
+    home, project = m.Path(root) / "home", m.Path(root) / "project"
+    for base in (home, project):
+        (base / ".claude").mkdir(parents=True)
+    (home / ".claude/settings.json").write_text(json.dumps({
+        "permissions": {"ask": ["Bash(grep *)", None, 7]}}))
+    (project / ".claude/settings.json").write_text(json.dumps({
+        "permissions": {"ask": ["Edit(/secret)"], "allow": ["Bash"]}}))
+    (project / ".claude/settings.local.json").write_text(json.dumps({
+        "permissions": {"ask": ["mcp__db"]}}))
+    with patch.object(m.Path, "home", return_value=home):
+        want("ask loads from user/project/local settings",
+             m.load_patterns(str(project), "ask") == ["Bash(grep *)", "Edit(/secret)", "mcp__db"])
+        ad = m.evaluate(dict(ask_payload, cwd=str(project), permission_mode="auto"), cfg)
+        want("settings ask reaches auto evaluator", ad["action"] == "prompt")
+
+# A forced ask is a one-time decision. Always would save a useless grant that
+# cannot override ask; a stale/rogue Always response must not approve the call.
+with patch.object(m, "load_config", return_value=cfg_exact), \
+     patch.object(m, "load_patterns", side_effect=lambda cwd, kind:
+                  ["Bash(grep *)"] if kind == "ask" else []) as patterns, \
+     patch.object(m, "acquire_slot", return_value=0), patch.object(m, "release_slot"), \
+     patch.object(m, "pet_record"), patch.object(m, "tally_record"), \
+     patch.object(m, "write_rule") as save, patch.object(m, "toast_ask") as toast:
+    for label, decision in (("Yes", "allow"), ("No", "deny"), ("Always", "ask"), ("", "ask")):
+        toast.return_value = (0, label)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            arc = m.hook_pretooluse(ask_payload)
+        want(f"ask hook {label} -> {decision}", arc == 0 and
+             json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == decision)
+        want(f"ask hook {label} offers only one-time buttons",
+             toast.call_args is not None and toast.call_args.args[2] == ["Yes", "No"])
+    toast.side_effect = RuntimeError("toast unavailable")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        arc = m.hook_pretooluse(ask_payload)
+    want("ask hook UI failure asks in terminal", arc == 0 and
+         json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "ask")
+    want("ask hook never persists an allow rule", not save.called)
+    patterns.side_effect = lambda cwd, kind: []
+    toast.side_effect = None
+    toast.return_value = (1, "Always")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        arc = m.hook_pretooluse(dict(ask_payload, tool_input={"command": "npm run build"}))
+    want("ordinary prompt still offers and saves Always", arc == 0 and
+         toast.call_args.args[2] == ["Yes", "Always", "No"] and save.call_count == 1
+         and save.call_args.args[0] == "Bash(npm run build)" and
+         json.loads(out.getvalue())["hookSpecificOutput"]["permissionDecision"] == "allow")
+
+# The extra settings read must preserve the hook's fail-open contract.
+def broken_ask(cwd, kind):
+    if kind == "ask":
+        raise ValueError("unreadable ask settings")
+    return []
+with patch.object(m, "load_config", return_value=cfg), \
+     patch.object(m, "load_patterns", side_effect=broken_ask), \
+     patch.object(sys, "stdin", io.StringIO(json.dumps(ask_payload))):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        arc = m.cmd_hook(m.argparse.Namespace(event="pretooluse"))
+    want("ask settings failure exits zero with no decision", arc == 0 and out.getvalue() == "")
+
 # v0.2: last-message fallback parses the transcript JSONL (skips sidechains/tool_use)
 tpath = os.path.join(tempfile.mkdtemp(), "t.jsonl")
 with open(tpath, "w") as f:

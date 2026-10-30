@@ -233,11 +233,15 @@ Defaults live in the binary; override any key in `noti.config.json` (repo) or
   (including question/plan surfacing). In `dontAsk` mode noti never shows a
   *permission* toast (you asked not to be asked) — questions and plans still
   surface, because the session blocks on them regardless of permission mode.
-- In `auto` mode, noti defers permission decisions to Claude's native flow after
-  checking deny rules. It emits no permission decision, including for safe-listed
-  commands and saved allow rules. Questions, plans, summaries, alerts, and the
-  pet still work.
-- noti enforces deny/allow rules from your **user** (`~/.claude/settings.json`) and
+- Explicit `ask` rules beat mode approvals, saved allows, and safe-lists. They
+  show **Yes / No**, including in `auto` and `bypassPermissions`; no `Always`
+  grant can override an ask rule. In `plan` and `dontAsk`, noti defers to
+  Claude's native restrictions instead of offering permission approvals.
+- In `auto` mode, calls without a deny or ask match defer to Claude's native
+  flow, including safe-listed commands and saved allow rules. noti emits no
+  permission decision for those calls. Questions, plans, summaries, alerts, and
+  the pet still work.
+- noti enforces deny/ask/allow rules from your **user** (`~/.claude/settings.json`) and
   **project** (`.claude/settings.json`, `.claude/settings.local.json`) settings —
   the same files Claude Code merges. It does **not** read enterprise *managed*
   settings (`/Library/Application Support/ClaudeCode/managed-settings.json`): a
