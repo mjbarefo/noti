@@ -1196,11 +1196,11 @@ def evaluate(payload: dict, cfg: dict) -> dict:
     if matches_any(tool, tinput, load_patterns(cwd, "deny"), cwd, broad=True):
         return {"action": "deny", "reason": "noti: matches a deny rule"}
 
-    # 3. Respect the user's chosen permission mode (after deny). dontAsk means
-    #    "never prompt me" — noti must not toast either. (auto mode falls
-    #    through: noti's toast simply replaces the prompt the classifier
-    #    would have shown.)
-    if mode in ("bypassPermissions", "plan", "dontAsk"):
+    # 3. Respect the user's chosen permission mode (after deny). PreToolUse
+    #    precedes auto's classifier: a toast invents a prompt, and an allow
+    #    replaces a better-informed decision. Defer without emitting either.
+    #    dontAsk means "never prompt me" — noti must not toast either.
+    if mode in ("bypassPermissions", "plan", "dontAsk", "auto"):
         return {"action": "defer", "reason": f"noti: {mode} mode"}
 
     # 4. acceptEdits: Claude already auto-accepts edits — don't nag.

@@ -49,7 +49,7 @@ check "find -delete NOT allowed"    "$(j Bash '{"command":"find . -delete"}' def
 check "git --output NOT auto-allowed" "$(j Bash '{"command":"git log --output=/tmp/x"}' default)" prompt
 check "git branch NAME NOT auto-allowed" "$(j Bash '{"command":"git branch evil"}' default)"  prompt
 check "dontAsk mode defers"         "$(j Bash '{"command":"rm -rf build"}' dontAsk)"          defer
-check "auto mode still governs"     "$(j Bash '{"command":"rm -rf build"}' auto)"             prompt
+check "auto mode defers"            "$(j Bash '{"command":"rm -rf build"}' auto)"             defer
 
 # v0.3: Claude-to-human interaction tools surface in every permission mode
 check "simple question toasts"      "$(j AskUserQuestion '{"questions":[{"question":"Which auth approach?","header":"Auth","options":[{"label":"JWT"},{"label":"Sessions"},{"label":"OAuth"}],"multiSelect":false}]}' default)" question
@@ -64,6 +64,8 @@ check "empty question text notifies" "$(j AskUserQuestion '{"questions":[{"heade
 check "4-option question toasts"    "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"}]}]}' default)" question
 check "5-option question notifies"  "$(j AskUserQuestion '{"questions":[{"question":"Q","options":[{"label":"A"},{"label":"B"},{"label":"C"},{"label":"D"},{"label":"E"}]}]}' default)" notice
 check "plan review toasts (plan mode)" "$(j ExitPlanMode '{"plan":"# Plan\n1. do the thing"}' plan)" plan
+check "question surfaces in auto"   "$(j AskUserQuestion '{"questions":[{"question":"Proceed?","options":[{"label":"A"},{"label":"B"}]}]}' auto)" question
+check "plan review surfaces in auto" "$(j ExitPlanMode '{"plan":"# Plan\n1. do the thing"}' auto)" plan
 
 echo
 echo "rule round-trip (an 'Always' rule must match the next identical call)"
@@ -92,8 +94,9 @@ rt=$?
 echo
 echo "security regressions (fixed review findings must stay fixed)"
 python3 - "$CWD" <<'PY'
-import sys, copy
+import sys, copy, io, contextlib
 from importlib.machinery import SourceFileLoader
+from unittest.mock import patch
 m = SourceFileLoader("notimod", "./noti").load_module()
 cfg = m.load_config()
 bad = 0
@@ -174,6 +177,45 @@ try:
     want("deny beats acceptEdits", d["action"] == "deny")
 finally:
     m.load_patterns = orig
+
+# C1: PreToolUse runs BEFORE auto mode's classifier. No permission toast or
+# allow decision may replace it, even for safe-listed / explicitly allowed calls.
+auto_cfg = copy.deepcopy(cfg)
+auto_cfg["approval"]["mcp_autoallow_servers"] = ["db"]
+auto_cases = [
+    ("Bash", {"command": "npm run build"}),
+    ("Bash", {"command": "grep foo bar"}),
+    ("Edit", {"file_path": sys.argv[1] + "/x"}),
+    ("Write", {"file_path": sys.argv[1] + "/x"}),
+    ("MultiEdit", {"file_path": sys.argv[1] + "/x"}),
+    ("NotebookEdit", {"notebook_path": sys.argv[1] + "/x.ipynb"}),
+    ("WebFetch", {"url": "https://github.com/x"}),
+    ("mcp__db__get_rows", {}),
+]
+with patch.object(m, "load_patterns", side_effect=lambda cwd, kind:
+                  ["Bash", "Edit", "WebFetch", "mcp__db"] if kind == "allow" else []) as lp:
+    for tool, ti in auto_cases:
+        ad = m.evaluate({"tool_name": tool, "tool_input": ti,
+                         "permission_mode": "auto", "cwd": sys.argv[1]}, auto_cfg)
+        want(f"auto defers {tool}: {ti}", ad["action"] == "defer")
+    want("auto never consults allow rules", all(c.args[1] != "allow" for c in lp.call_args_list))
+with patch.object(m, "load_patterns", side_effect=lambda cwd, kind:
+                  ["Bash(grep *)"] if kind == "deny" else []):
+    ad = m.evaluate({"tool_name": "Bash", "tool_input": {"command": "grep foo bar"},
+                     "permission_mode": "auto", "cwd": sys.argv[1]}, cfg)
+    want("auto still enforces deny before deferring", ad["action"] == "deny")
+auto_payload = {"tool_name": "Bash", "tool_input": {"command": "grep foo bar"},
+                "permission_mode": "auto", "cwd": sys.argv[1], "session_id": "auto"}
+with patch.object(m, "load_config", return_value=cfg), \
+     patch.object(m, "toast_ask") as toast, patch.object(m, "acquire_slot") as slot, \
+     patch.object(m, "tally_record") as tally, patch.object(m, "pet_record") as pet:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        arc = m.hook_pretooluse(auto_payload)
+    want("auto hook exits zero with no decision", arc == 0 and out.getvalue() == "")
+    want("auto hook never opens a permission UI", not toast.called and not slot.called)
+    want("auto hook keeps pet running without recording approval",
+         pet.call_args.args[2] == "running" and not tally.called)
 
 # F5: write_rule refuses to clobber an unparseable settings file
 import tempfile, os, json

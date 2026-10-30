@@ -108,7 +108,8 @@ CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
 
 **Status: C2 and C3 shipped 2026-09-09** (`_bash_allow_parts` /
 `_bash_deny_parts` / `_bash_rule_hit`, 30 new regression assertions). C6 was found
-while fixing them and is not yet scheduled. C1, C4, C5 remain open.
+while fixing them and is not yet scheduled. C1 is implemented below; C4 and C5
+remain open.
 
 ### C1 — auto mode must defer, not prompt (P0)
 
@@ -130,6 +131,11 @@ while fixing them and is not yet scheduled. C1, C4, C5 remain open.
   WebFetch/MCP; a deny rule still returns `deny` in auto mode (the hard floor);
   `AskUserQuestion`/`ExitPlanMode` still surface in auto mode (step 0 precedes
   the mode gate, and a question blocks in every mode).
+- **Implemented 2026-10-30.** `auto` now defers after deny, before every allow
+  path. `test.sh` covers every governed tool family, safe-listed commands,
+  explicit allow rules, the deny floor, question/plan surfaces, and a hook that
+  exits 0 with empty stdout, no toast/slot, and a running pet state. This also
+  avoids C5's auto-mode allow-rule bypass; explicit ask handling follows in C4.
 
 ### C2 — compound commands: allow rules over-match (P0, security)
 
