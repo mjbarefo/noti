@@ -377,6 +377,23 @@ try:
 finally:
     m.load_patterns = orig
 
+# C6 controls only: no redirect matcher change until the live-engine probe in
+# docs/c6-matcher-verification.md is recorded. These pin protections that already
+# hold; do NOT encode today's prefix-rule redirect bypass as a passing test.
+with patch.object(m, "load_patterns", return_value=[]):
+    for command in ("ls -la > /tmp/noti-c6-out", "git log >> /tmp/noti-c6-out",
+                    "ls -la 2> /tmp/noti-c6-err", "cat < /tmp/noti-c6-in",
+                    "cat <> /tmp/noti-c6-in", "ls -la > /dev/null", "ls -la 2>&1"):
+        cd = m.evaluate({"tool_name": "Bash", "tool_input": {"command": command},
+                         "permission_mode": "default", "cwd": sys.argv[1]}, cfg)
+        want(f"redirect cannot use the read-only safe-list: {command}", cd["action"] == "prompt")
+for command in ('echo "a > b"', r"echo a \> b"):
+    want(f"literal redirect character still matches an explicit rule: {command}",
+         m.matches_any("Bash", {"command": command}, ["Bash(echo:*)"], sys.argv[1]))
+want("redirect does not hide a compound deny",
+     m.matches_any("Bash", {"command": "ls -la > /tmp/noti-c6-out && rm -rf /tmp/noti-c6"},
+                   ["Bash(rm *)"], sys.argv[1], broad=True))
+
 # C4: ask uses deny's ANY-subcommand semantics and outranks every allow path.
 ask_payload = {"tool_name": "Bash", "tool_input": {"command": "grep foo bar"},
                "permission_mode": "default", "cwd": sys.argv[1], "session_id": "ask-rule"}

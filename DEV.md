@@ -29,6 +29,8 @@ Explicit non-goals, so they don't creep back in:
 
 ## The auto-mode reckoning (2026-09-09)
 
+Historical diagnosis; the implementation status is recorded under C1/C4 below.
+
 The charter above is unchanged. What changed is the world it runs in — and one
 sentence of the code now contradicts the docs it was written against.
 
@@ -106,10 +108,22 @@ Ship order follows the tags, not the numbering: C2/C3 first (exploitable
 today, in every permission mode), then C1 (the clunk), then C4, then C5. Each lands with the regression tests named below; per
 CONTRIBUTING these encode fixed vulnerabilities and never get weakened later.
 
-**Status: C2 and C3 shipped 2026-09-09** (`_bash_allow_parts` /
+**Status on PR #2: C2 and C3 implemented 2026-09-09** (`_bash_allow_parts` /
 `_bash_deny_parts` / `_bash_rule_hit`, 30 new regression assertions). C6 was found
 while fixing them and still requires live verification. C1 and C4 are implemented
 below; C5's independent allow-filter work remains open (C1 avoids it in auto).
+
+### Follow-up patch sequence (2026-10-30)
+
+| Order | Exact files | Patch and regression checks |
+|---|---|---|
+| 1 — C1 | `noti`, `test.sh`, `README.md`, `DEV.md` | Add auto deferral in `evaluate()` after deny. Test Bash/Edit/Write/MultiEdit/NotebookEdit/WebFetch/MCP, safe-list and saved-allow bypass prevention, question/plan surfaces, deny precedence, and empty hook stdout with no toast. |
+| 2 — C4 | `noti`, `test.sh`, `README.md`, `DEV.md` | Request `ask` patterns in `evaluate()` and match with `broad=True` before any allow. Suppress Always in `hook_pretooluse()` for forced asks. Test real settings loading, deny > ask > allow/safe-list, mode handling, nested Bash, one-time Yes/No, rogue Always, UI/settings failures, and ordinary Always. |
+| 3 — C6 gate | `test.sh`, `DEV.md`, `docs/c6-matcher-verification.md` | Preserve the Bash scanner and matcher. Pin existing safe-list rejection, quoted/escaped controls, and deny coverage. Record live native-matcher results before choosing redirect behavior. |
+
+Every implementation commit runs `ruff check noti` and `./test.sh` through the
+pre-commit gate. No Swift/UI source change is needed. These patches are on the
+open PR branch, not a claim that they have shipped on `main`.
 
 ### C1 — auto mode must defer, not prompt (P0)
 
@@ -243,6 +257,16 @@ splits on command separators only.
   covers and the call falls through to a toast. Deny matching needs no change.
 - **Tests**: `ls -la > ~/.zshrc` does not allow under `Bash(ls -la:*)`; a
   quoted `echo "a > b"` still allows; deny behavior is unchanged.
+- **2026-10-30 gate remains open.** Current upstream
+  [redirection documentation](https://code.claude.com/docs/en/permissions#redirections)
+  describes a separate target-file check, including Edit/Read rules and
+  exceptions for `/dev/null` and descriptor redirects. This is documentation
+  evidence, not a live-engine result, and does not justify choosing the proposed
+  separator approach above. This environment has no Claude CLI/live matcher.
+  The [verification matrix](docs/c6-matcher-verification.md) records the required
+  experiment and follow-up files. Only existing safe-list, quoted/escaped
+  literal, and deny protections are pinned in `test.sh`; no redirect matcher or
+  rule-minting behavior changes in this patch.
 
 ### C4 — `permissions.ask` is invisible to noti (P1, security)
 
